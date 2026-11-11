@@ -1,0 +1,170 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $sub := index .Values "redis-ha" -}}
+{{- $clientNs := include "redis-ha-secure.clientNamespaces" . | fromJsonArray -}}
+{{- $rp := int $sub.redis.port -}}
+{{- $sp := int $sub.sentinel.port -}}
+{{- /* With Linkerd, meshed clients reach opaque ports through the proxy's inbound port 4143 (opaque transport). */ -}}
+{{- $meshPort := 4143 -}}
+# Redis + Sentinel pods: ingress only from themselves, HAProxy, this release's Jobs,
+# the catalog's client namespaces, and monitoring. No LoadBalancer/Ingress anywhere.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "redis-ha-secure.fullname" . }}-server
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "redis-ha-secure.redisSelector" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if .Values.networkPolicy.egress.enabled }}
+    - Egress
+    {{- end }}
+  ingress:
+    # replication, Sentinel <-> Sentinel, Sentinel -> Redis
+    - from:
+        - podSelector:
+            matchLabels: {{- include "redis-ha-secure.redisSelector" . | nindent 14 }}
+        {{- if $sub.haproxy.enabled }}
+        - podSelector:
+            matchLabels: {{- include "redis-ha-secure.haproxySelector" . | nindent 14 }}
+        {{- end }}
+        - podSelector:
+            matchLabels: {{- include "redis-ha-secure.jobClientLabels" . | nindent 14 }}
+      ports:
+        - { port: {{ $rp }}, protocol: TCP }
+        - { port: {{ $sp }}, protocol: TCP }
+        {{- if .Values.linkerd.enabled }}
+        - { port: {{ $meshPort }}, protocol: TCP }
+        {{- end }}
+    {{- if and $clientNs (not $sub.haproxy.enabled) }}
+    # Sentinel-aware clients: discovery on 26379, data on 6379
+    - from:
+        {{- range $clientNs }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      ports:
+        - { port: {{ $rp }}, protocol: TCP }
+        - { port: {{ $sp }}, protocol: TCP }
+        {{- if .Values.linkerd.enabled }}
+        - { port: {{ $meshPort }}, protocol: TCP }
+        {{- end }}
+    {{- end }}
+    {{- with .Values.networkPolicy.monitoring.from }}
+    - from: {{- toYaml . | nindent 8 }}
+      ports:
+        - { port: 9121, protocol: TCP }
+        {{- if $.Values.linkerd.enabled }}
+        - { port: 4191, protocol: TCP }
+        - { port: {{ $meshPort }}, protocol: TCP }
+        {{- end }}
+    {{- end }}
+  {{- if .Values.networkPolicy.egress.enabled }}
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: {{- include "redis-ha-secure.redisSelector" . | nindent 14 }}
+      ports:
+        - { port: {{ $rp }}, protocol: TCP }
+        - { port: {{ $sp }}, protocol: TCP }
+        {{- if .Values.linkerd.enabled }}
+        - { port: {{ $meshPort }}, protocol: TCP }
+        {{- end }}
+    - to: {{- toYaml .Values.networkPolicy.egress.dns | nindent 8 }}
+      ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+    {{- if .Values.linkerd.enabled }}
+    - to: {{- toYaml .Values.networkPolicy.egress.linkerdControlPlane | nindent 8 }}
+      ports:
+        - { port: 8080, protocol: TCP }
+        - { port: 8086, protocol: TCP }
+        - { port: 8090, protocol: TCP }
+    {{- end }}
+    {{- if .Values.dr.restore.enabled }}
+    # DR bootstrap restore: the dr-restore-fetch init container downloads the backup.
+    - {{- with .Values.dr.storage.egressTo }}
+      to: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      ports:
+        {{- range .Values.dr.storage.egressPorts }}
+        - { port: {{ . }}, protocol: TCP }
+        {{- end }}
+    {{- end }}
+  {{- end }}
+{{- if $sub.haproxy.enabled }}
+{{- $hp := list (int $sub.haproxy.containerPort) }}
+{{- if $sub.haproxy.readOnly.enabled }}{{ $hp = append $hp (int $sub.haproxy.readOnly.port) }}{{ end }}
+---
+# HAProxy front door: the ONLY entry point for clients in HAProxy mode.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "redis-ha-secure.fullname" . }}-haproxy
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "redis-ha-secure.haproxySelector" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if .Values.networkPolicy.egress.enabled }}
+    - Egress
+    {{- end }}
+  ingress:
+    - from:
+        {{- range $clientNs }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+        # this release's Jobs and the migration pod
+        - podSelector:
+            matchLabels: {{- include "redis-ha-secure.jobClientLabels" . | nindent 14 }}
+      ports:
+        {{- range $hp }}
+        - { port: {{ . }}, protocol: TCP }
+        {{- end }}
+        {{- if .Values.linkerd.enabled }}
+        - { port: {{ $meshPort }}, protocol: TCP }
+        {{- end }}
+    {{- with .Values.networkPolicy.monitoring.from }}
+    - from: {{- toYaml . | nindent 8 }}
+      ports:
+        {{- if $sub.haproxy.metrics.enabled }}
+        - { port: {{ $sub.haproxy.metrics.port }}, protocol: TCP }
+        {{- end }}
+        {{- if $.Values.linkerd.enabled }}
+        - { port: 4191, protocol: TCP }
+        - { port: {{ $meshPort }}, protocol: TCP }
+        {{- end }}
+    {{- end }}
+  {{- if .Values.networkPolicy.egress.enabled }}
+  egress:
+    # health checks + client traffic to Redis (6379) and Sentinel (26379)
+    - to:
+        - podSelector:
+            matchLabels: {{- include "redis-ha-secure.redisSelector" . | nindent 14 }}
+      ports:
+        - { port: {{ $rp }}, protocol: TCP }
+        - { port: {{ $sp }}, protocol: TCP }
+        {{- if .Values.linkerd.enabled }}
+        - { port: {{ $meshPort }}, protocol: TCP }
+        {{- end }}
+    - to: {{- toYaml .Values.networkPolicy.egress.dns | nindent 8 }}
+      ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+    {{- if .Values.linkerd.enabled }}
+    - to: {{- toYaml .Values.networkPolicy.egress.linkerdControlPlane | nindent 8 }}
+      ports:
+        - { port: 8080, protocol: TCP }
+        - { port: 8086, protocol: TCP }
+        - { port: 8090, protocol: TCP }
+    {{- end }}
+  {{- end }}
+{{- end }}
+{{- end }}

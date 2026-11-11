@@ -1,0 +1,15 @@
+# Test overlay for scripts/09-dr-test.sh: backups to a throw-away S3 endpoint
+# (`rclone serve s3` in namespace dr-test, created by the test).
+dr:
+  storage:
+    remote: "s3:redis-dr/redis"
+    existingSecret: redis-ha-dr-storage
+    egressPorts: [8080]
+  backup:
+    enabled: true
+    # Never fires on its own (Feb 31). The test triggers Jobs from the CronJob.
+    schedule: "0 0 31 2 *"
+    retention:
+      days: 14
+      keepLast: 3
+    spoolSizeLimit: 1Gi

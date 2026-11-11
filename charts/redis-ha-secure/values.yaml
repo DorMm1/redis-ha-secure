@@ -1,0 +1,934 @@
+# =============================================================================
+# redis-ha-secure - wrapper around DandyDeveloper/redis-ha 4.39.0
+# =============================================================================
+# Layout of this file
+#   1. global.redisSecure      shared knobs readable from BOTH this chart and the
+#                              redis-ha subchart templates (tpl'd customConfig)
+#   2. acl / infraCredentials  ACL phase flag, ACL Secret, infra credentials
+#   3. aclUsers                declarative catalog (Kubernetes SA -> Redis ACL user)
+#   4. jobs / networkPolicy / linkerd / monitoring
+#   5. redis-ha                subchart values. EVERY key below was checked against
+#                              the pinned chart's values.yaml (4.39.0). Nothing is invented.
+#
+# No secret material belongs in this file (or any values file). Passwords live in:
+#   * the infra credentials Secret  (pre-created / ESO, or generated once by the build Job)
+#   * per-consumer Secrets in the workload namespaces (pre-created / ESO, or generated once)
+# =============================================================================
+
+global:
+  redisSecure:
+    # maxmemory = <this percentage> of redis-ha.redis.resources.limits.memory when
+    # redis-ha.redis.config.maxmemory is "auto". >= 1000mb results are rounded down to
+    # 100mb. Example: 4Gi -> 2867 -> 2800mb. The remaining ~30% is headroom for
+    # fork copy-on-write (BGSAVE / AOF rewrite / full sync), replica + client
+    # output buffers, and allocator fragmentation.
+    maxmemoryPercent: 70
+    # HAProxy front door (used only when redis-ha.haproxy.enabled). Read by the
+    # haproxy customConfig in the subchart context, hence under `global`.
+    haproxy:
+      # Per HAProxy pod. Validated: haproxy.replicas * maxconn + 500 <= redis maxclients.
+      maxconn: 3000
+      # /healthz returns 503 until a master was seen once since start (rollout gate).
+      readinessRequiresMaster: true
+      # Refuse client connections unless >= 2 Sentinels agree on the master.
+      quorumRouting: true
+      # Log every client connection (tcplog) to stdout. Health-check state changes
+      # are always logged.
+      logConnections: false
+
+# -----------------------------------------------------------------------------
+# ACL
+# -----------------------------------------------------------------------------
+acl:
+  # 1 = default user keeps full rights (chart auth secret) and is used ONLY by
+  #     Sentinel / replication / chart probes. App users come from aclUsers.
+  # 2 = dedicated least-privilege infra users (replica-user, sentinel-user,
+  #     sentinel-peer, haproxy-user, exporter-user, acl-admin). Redis and Sentinel
+  #     `default` are demoted to probe-only identities. See README "Phase 1 -> 2".
+  phase: 1
+  phase2:
+    # When false, phase 2 only ADDS the infra users and switches replication/Sentinel
+    # to them. `default` keeps full rights. Use this as an optional intermediate step.
+    demoteDefault: true
+
+  # ONE Secret holds every ACL artefact. It is built by the pre-install/pre-upgrade
+  # Job (hashes are computed there; never in git) and is mounted WITHOUT subPath:
+  #   users.acl            -> aclfile of every Redis node
+  #   sentinel-users.acl   -> aclfile of every Sentinel
+  #   redis-infra.conf     -> `include`d by redis.conf   (masteruser/masterauth)
+  #   sentinel-infra.conf  -> `include`d by sentinel.conf (auth-user/auth-pass, sentinel-user/pass)
+  # The name must match redis-ha.extraVolumes (YAML anchor below). The chart validates this.
+  secretName: &aclSecretName redis-ha-acl
+  # Must match redis-ha.redis.extraVolumeMounts / redis-ha.sentinel.extraVolumeMounts.
+  redisMountPath: /etc/redis-secure/acl
+  sentinelMountPath: /etc/redis-secure/sentinel-acl
+
+  # Username convention, mirrors the Keycloak users: <prefix>.<namespace>.<sa-name>
+  usernamePrefix: system.serviceaccount
+
+  # Appended to EVERY catalog user after the generated rules (for example
+  # ["-scan", "-randomkey"] to stop key-name enumeration across tenants; see README pitfalls).
+  appUserExtraRules: []
+
+  # Catalog users on the SENTINELS (same username/password as on Redis) so that
+  # Sentinel-aware clients can discover the master.
+  #   auto  = only when HAProxy is disabled (in HAProxy mode clients never reach Sentinel)
+  #   true / false = force
+  sentinelClientAccess: auto
+  # Discovery only, from the Redis Sentinel docs, plus +switch-master notifications.
+  sentinelClientRules: >-
+    resetkeys resetchannels &+switch-master -@all +auth +hello +ping +role +command
+    +client|getname +client|id +client|setname +sentinel|get-master-addr-by-name
+    +sentinel|master +sentinel|masters +sentinel|myid +sentinel|replicas +sentinel|slaves
+    +sentinel|sentinels +subscribe +unsubscribe
+
+  # Rules of the infrastructure identities. Every line is prefixed with
+  # `reset on #<sha256>` by the build Job. Change these only with care. The reload Job
+  # runs an ACL DRYRUN preflight against a throw-away local redis-server and refuses
+  # to apply a file in which an infra user lost a command Sentinel/replication needs
+  # (guards against redis/redis#9772).
+  infraRules:
+    # --- Redis nodes ---------------------------------------------------------------
+    # Phase 1 `default`: full command set, but only the Sentinel hello channel
+    # (see the Sentinel docs warning about forged __sentinel__:hello messages).
+    redisDefaultPhase1: "~* resetchannels &__sentinel__:hello +@all"
+    # Phase 2 `default`: only what the chart's built-in scripts need
+    # (probes: PING/ROLE, preStop + split-brain-fix: INFO, split-brain reinit: SHUTDOWN).
+    redisDefaultPhase2: "resetkeys resetchannels -@all +ping +role +info +shutdown"
+    replicaUser: "resetkeys resetchannels -@all +psync +replconf +ping"
+    sentinelUser: >-
+      resetkeys resetchannels &__sentinel__:hello -@all +multi +slaveof +ping +exec
+      +subscribe +config|rewrite +role +publish +info +client|setname +client|kill +script|kill
+    haproxyUser: "resetkeys resetchannels -@all +ping +info +role +auth"
+    # redis_exporter README ("Redis 8.8 and later") with +eval and wildcard +client
+    # removed (no scripting, no CLIENT KILL). Verified on a live cluster with ACL LOG.
+    exporterUser: >-
+      resetkeys resetchannels -@all +@connection +memory -readonly +strlen +config|get
+      +xinfo +pfcount -quit +zcard +type +xlen -readwrite -command +command|info
+      +client|list +client|info +client|setname +client|getname +client|id -wait +scard
+      +llen +hlen +arcount +get +slowlog +cluster|info +cluster|slots +cluster|nodes
+      -hello -echo +info +latency +scan -reset -auth -asking
+    # Used by the reload / drift Jobs and the test scripts.
+    aclAdmin: >-
+      resetkeys resetchannels -@all +ping +info +role +acl|load +acl|list +acl|getuser
+      +acl|setuser +acl|log +acl|dryrun +acl|whoami +acl|users +config|get +config|set
+      +config|rewrite +client|list +client|kill +client|setname
+    # --- Sentinels -------------------------------------------------------------------
+    sentinelDefaultPhase1: "~* &* +@all"
+    # Chart scripts: liveness PING, lib.sh get-master-addr-by-name, init/preStop
+    # SENTINEL FAILOVER, split-brain-fix SENTINEL RESET.
+    sentinelDefaultPhase2: >-
+      resetkeys resetchannels -@all +ping +sentinel|get-master-addr-by-name
+      +sentinel|failover +sentinel|reset
+    # Sentinel -> Sentinel links (`sentinel sentinel-user/sentinel-pass`). Commands a
+    # Sentinel sends to its peers: AUTH, CLIENT SETNAME, PING, PUBLISH hello,
+    # SENTINEL IS-MASTER-DOWN-BY-ADDR.
+    sentinelPeer: >-
+      resetkeys resetchannels &__sentinel__:hello -@all +ping +publish +client|setname
+      +sentinel|is-master-down-by-addr
+    sentinelHaproxy: "resetkeys resetchannels -@all +ping +sentinel|get-master-addr-by-name"
+    # RedisShake writer (migration.enabled): RESTORE for the initial copy, then the
+    # replicated write stream of the old cluster. No admin, flush, pub/sub or scripting.
+    migrationUser: >-
+      ~* resetchannels -@all +@write +@keyspace +@connection +@transaction -@dangerous
+      +restore +select +ping +info -flushall -flushdb -swapdb -@scripting -@pubsub
+    # DR backup (dr.backup.enabled): `redis-cli --rdb` = REPLCONF rdb-only + SYNC, plus
+    # ROLE/INFO to pick the freshest replica. Verified with ACL LOG on Redis 8.8.
+    # SYNC streams the WHOLE dataset: treat backup-password like a read-all credential.
+    backupUser: "resetkeys resetchannels -@all +ping +role +info +sync +replconf"
+    sentinelAclAdmin: >-
+      resetkeys resetchannels -@all +ping +info +role +acl|load +acl|list +acl|getuser
+      +acl|setuser +acl|log +acl|dryrun +acl|whoami +acl|users +client|list +client|setname
+      +sentinel|master +sentinel|masters +sentinel|replicas +sentinel|sentinels
+      +sentinel|ckquorum +sentinel|get-master-addr-by-name +sentinel|failover +sentinel|set
+      +sentinel|config +sentinel|myid +sentinel|info-cache
+
+  reload:
+    # Hook Job (post-install/post-upgrade) that waits for the mounted Secret to update,
+    # switches runtime auth (phase changes), runs ACL LOAD on every node through the
+    # headless service and verifies ACL LIST is identical everywhere. No pod restarts.
+    enabled: true
+    timeoutSeconds: 600
+    backoffLimit: 1
+  driftCheck:
+    enabled: true
+    schedule: "*/15 * * * *"
+
+# Infrastructure credentials (one Secret in the release namespace).
+infraCredentials:
+  secretName: &infraSecretName redis-ha-infra-credentials
+  # true  -> the build Job creates the Secret / missing keys ONCE with random values
+  #          (existing keys are never overwritten).
+  # false -> the Secret must be pre-created (for example by External Secrets Operator).
+  generate: true
+  # Key names. `default` and `sentinelDefault` are also wired into the chart
+  # (redis-ha.authKey / redis-ha.sentinel.authKey) and validated.
+  # Rotation: add `<key>-previous` with the old value (see README runbook).
+  keys:
+    default: default-password                    # Redis `default` (chart AUTH env)
+    sentinelDefault: sentinel-default-password   # Sentinel `default` (chart SENTINELAUTH env)
+    aclAdmin: acl-admin-password
+    exporter: exporter-password
+    replica: replica-password                    # phase 2
+    sentinelUser: sentinel-user-password         # phase 2
+    sentinelPeer: sentinel-peer-password         # phase 2
+    migration: migration-password                # migration.enabled only
+    backup: backup-password                      # dr.backup.enabled only
+
+# -----------------------------------------------------------------------------
+# Declarative user catalog: one Redis ACL user per Kubernetes ServiceAccount.
+# Username: <acl.usernamePrefix>.<namespace>.<serviceAccount>
+# -----------------------------------------------------------------------------
+# - namespace: orders                 # concrete namespace. Wildcards are REJECTED.
+#   serviceAccount: orders-api
+#   # Optional pre-created Secret (in `namespace`) holding the plaintext password.
+#   # If omitted, the build Job generates a password ONCE into `credentialsSecret`.
+#   passwordSecret: { name: redis-acl-orders-api, key: password }
+#   credentialsSecret: redis-acl-orders-api   # default: redis-acl-<serviceAccount>
+#   scripting: false                          # true -> +@scripting (minus SCRIPT FLUSH/FUNCTION mgmt) instead of -@scripting
+#   extraRules: []                            # appended verbatim, e.g. ["+role"]
+#   redis:
+#     - keyPrefix: "orders:"
+#       access: [read, write]                 # read -> %R~  write -> %W~  both -> ~
+#     - channel: "orders.events.*"
+#       access: [publish, subscribe]
+aclUsers: []
+
+# -----------------------------------------------------------------------------
+# Jobs (ACL build / reload / drift check)
+# -----------------------------------------------------------------------------
+jobs:
+  kubectlImage:
+    repository: docker.io/alpine/k8s
+    tag: "1.35.10"
+    pullPolicy: IfNotPresent
+  # The reload/drift Jobs use the same (patched) Redis image as the cluster
+  # (redis-ha.image) so redis-cli matches the server.
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  podAnnotations:
+    # Jobs talk to meshed Redis pods, so they must be meshed too. Native sidecars
+    # (Kubernetes >= 1.29) let the Job complete while the proxy is still running.
+    linkerd.io/inject: enabled
+    config.linkerd.io/proxy-enable-native-sidecar: "true"
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 128Mi }
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile: { type: RuntimeDefault }
+  containerSecurityContext:
+    runAsNonRoot: true
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities: { drop: [ALL] }
+    seccompProfile: { type: RuntimeDefault }
+  nodeSelector: {}
+  tolerations: []
+
+# -----------------------------------------------------------------------------
+# NetworkPolicy (replaces the chart's own, which is disabled below)
+# -----------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  # Client namespaces are derived from aclUsers. Add more here (for example namespaces
+  # that only use Sentinel discovery through another workload).
+  extraClientNamespaces: []
+  monitoring:
+    # Peers allowed to scrape the exporter (9121) and the Linkerd proxy metrics (4191).
+    from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: monitoring
+  egress:
+    enabled: true
+    dns:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            k8s-app: kube-dns
+    # Linkerd control plane (identity 8080, destination 8086, policy 8090).
+    linkerdControlPlane:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: linkerd
+
+# -----------------------------------------------------------------------------
+# Live migration from an existing (legacy) Redis into this release (RedisShake).
+# Runs a RedisShake Deployment that replicates from the OLD master (PSYNC: initial RDB,
+# then the live write stream) and writes into THIS cluster through HAProxy as
+# `migration-user` (key migration-password in the infra Secret). Remove it after cutover
+# (README "Migration from the existing redis-ha + HAProxy").
+# -----------------------------------------------------------------------------
+migration:
+  enabled: false
+  image:
+    repository: ghcr.io/tair-opensource/redisshake
+    tag: "4.7.0"
+    pullPolicy: IfNotPresent
+  source:
+    # The old cluster's HAProxy (always routes to its current master), host:port.
+    address: ""
+    # Empty = the old `default` user (requirepass).
+    username: ""
+    # Pre-created Secret IN THIS RELEASE'S NAMESPACE holding the old password.
+    passwordSecret:
+      name: ""
+      key: auth
+    tls: false
+  # RedisShake filters. PUBLISH/SPUBLISH are never replayed (subscribers of the new
+  # cluster must not receive old messages twice), and pub/sub needs no data copy.
+  filter:
+    allowKeyPrefixes: []
+    blockKeyPrefixes: []   # add an app's prefixes once that app writes to the new cluster
+    allowDbs: []
+    blockDbs: []
+  # RESTORE behaviour for keys that already exist in the target during the RDB phase.
+  # rewrite = idempotent: a restarted migration simply re-copies (keys deleted on the
+  # source between the two runs remain in the target; see README).
+  restoreBehavior: rewrite
+  targetMaxQps: 50000
+  resources:
+    requests: { cpu: 200m, memory: 256Mi }
+    limits: { cpu: "2", memory: 1Gi }
+  podAnnotations:
+    linkerd.io/inject: enabled
+
+# -----------------------------------------------------------------------------
+# Disaster recovery (README "Disaster recovery"). Replication and Sentinel protect
+# against pod/node loss only. A FLUSHALL, a bad deploy, a lost namespace or a lost
+# cluster reaches every replica, so data needs off-cluster, point-in-time copies.
+# -----------------------------------------------------------------------------
+dr:
+  storage:
+    # rclone "<remote>:<bucket>/<path>". The remote is defined ONLY by env vars in
+    # existingSecret, for example (S3):
+    #   RCLONE_CONFIG_S3_TYPE=s3  RCLONE_CONFIG_S3_PROVIDER=AWS  RCLONE_CONFIG_S3_ENV_AUTH=false
+    #   RCLONE_CONFIG_S3_ACCESS_KEY_ID=...  RCLONE_CONFIG_S3_SECRET_ACCESS_KEY=...
+    #   RCLONE_CONFIG_S3_REGION=eu-west-1  RCLONE_CONFIG_S3_SERVER_SIDE_ENCRYPTION=aws:kms
+    # Client-side encryption: add an rclone `crypt` remote on top (RCLONE_CONFIG_ENC_TYPE=crypt,
+    # RCLONE_CONFIG_ENC_REMOTE=s3:bucket/redis/prod, RCLONE_CONFIG_ENC_PASSWORD=<rclone obscure>)
+    # and set remote: "enc:". Keep the crypt password in your secret store, NOT only in this cluster.
+    remote: ""
+    existingSecret: redis-ha-dr-storage
+    image:
+      repository: docker.io/rclone/rclone
+      tag: "1.76.0"
+      pullPolicy: IfNotPresent
+    # NetworkPolicy egress from the Redis pods to the object store, used only while
+    # dr.restore.enabled (the backup Job pods are not selected by any policy).
+    # Example: [{ ipBlock: { cidr: 52.218.0.0/17 } }]. Empty = any destination on egressPorts.
+    egressTo: []
+    egressPorts: [443]
+  backup:
+    enabled: false
+    # RPO for "everything is lost" = this interval (replication covers everything else).
+    schedule: "7 * * * *"
+    timeZone: ""
+    # replica: snapshot only from a connected replica (no fork on the master); fail otherwise.
+    # any:     fall back to the master when no replica is connected.
+    source: replica
+    snapshotTimeoutSeconds: 1800
+    activeDeadlineSeconds: 3600
+    retention:
+      # Delete backups older than `days` (0 = never; use bucket lifecycle / Object Lock),
+      # but always keep the newest `keepLast`, so failing backups never prune the last good ones.
+      days: 14
+      keepLast: 24
+    # One RDB. Usually 20-50 % of used_memory.
+    spoolSizeLimit: 20Gi
+    resources:
+      snapshot:
+        requests: { cpu: 50m, memory: 64Mi }
+        limits: { cpu: "1", memory: 256Mi }
+      upload:
+        requests: { cpu: 50m, memory: 128Mi }
+        limits: { cpu: "1", memory: 512Mi }
+    podAnnotations:
+      linkerd.io/inject: enabled
+      config.linkerd.io/proxy-enable-native-sidecar: "true"
+  restore:
+    # Bootstrap restore of an EMPTY cluster (new cluster, or PVCs deleted). Use
+    # values-dr-restore.yaml: it also adds the dr-restore-* init containers to every Redis pod.
+    # Pods that already have data are never touched.
+    enabled: false
+    # Explicit backup id (directory under dr.storage.remote, see <remote>/LATEST).
+    backupId: ""
+    # Fixed name: the subchart does not template extraInitContainers.
+    configMapName: redis-ha-dr-restore
+
+# -----------------------------------------------------------------------------
+# Linkerd authorization policy
+# -----------------------------------------------------------------------------
+linkerd:
+  # Renders Server / MeshTLSAuthentication / AuthorizationPolicy (+ NetworkAuthentication).
+  # Pod injection itself is configured in redis-ha.redis.podAnnotations below. The chart
+  # fails rendering if they disagree.
+  enabled: true
+  serverApiVersion: policy.linkerd.io/v1beta3
+  policyApiVersion: policy.linkerd.io/v1alpha1
+  # Extra identities allowed on 6379/26379 in addition to the aclUsers ServiceAccounts.
+  extraClients: []   # - { name: debug-tools, namespace: platform }
+  monitoring:
+    # Meshed Prometheus ServiceAccounts allowed to scrape 9121.
+    serviceAccounts: []   # - { name: prometheus-k8s, namespace: monitoring }
+    # For an UNmeshed Prometheus: source CIDRs (NetworkAuthentication).
+    networks: []          # - cidr: 10.0.0.0/8
+
+# -----------------------------------------------------------------------------
+# Monitoring (Prometheus Operator CRDs)
+# -----------------------------------------------------------------------------
+monitoring:
+  podMonitor:
+    enabled: true
+    interval: 30s
+    labels: {}
+  prometheusRule:
+    enabled: true
+    labels: {}
+    memoryUsedRatioWarning: 0.80
+    fragmentationRatioWarning: 1.5
+    # Ignore fragmentation while the dataset is small (ratio is meaningless there).
+    fragmentationMinUsedBytes: 104857600
+    driftCheckJobAlert: true
+    # RedisAclDriftCheckFailed fires when the last SUCCESSFUL drift run is older than this
+    # (default: 3 missed 15-minute runs).
+    driftCheckMaxAgeSeconds: 3600
+    # RedisBackupMissing fires when the last SUCCESSFUL dr-backup run is older than this
+    # (default: 3 missed hourly runs). Only rendered when dr.backup.enabled.
+    backupMaxAgeSeconds: 10800
+
+# =============================================================================
+# redis-ha subchart (DandyDeveloper) - keys verified against chart 4.39.0
+# =============================================================================
+redis-ha:
+  image:
+    repository: public.ecr.aws/docker/library/redis
+    # Latest patch of the chart's Redis line (8.8.x). It includes the Lua fixes for
+    # CVE-2025-49844/46817/46818/46819 (fixed in 8.2.2+) and the 8.8.1-8.8.4 security
+    # fixes (ACL key-permission bypass, MULTI/EXEC after ACL revocation, ...).
+    # Pin by digest in production: tag@sha256:...
+    tag: 8.8.4-alpine
+    pullPolicy: IfNotPresent
+
+  # 1 master + 2 replicas, each pod also runs one Sentinel.
+  replicas: 3
+  hardAntiAffinity: true
+  topologySpreadConstraints:
+    enabled: true
+    maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+
+  # Chart auth wiring. Passwords come from the infra Secret (never from values).
+  # Keep these equal to infraCredentials.* (validated).
+  auth: true
+  existingSecret: *infraSecretName
+  authKey: default-password
+
+  # Dedicated ServiceAccount, no API token (nothing in the pod talks to the API server).
+  serviceAccount:
+    create: true
+    automountToken: false
+  # The chart Role only grants endpoints/get, and nothing uses it without a token.
+  rbac:
+    create: false
+
+  podDisruptionBudget:
+    maxUnavailable: 1
+
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    fsGroupChangePolicy: OnRootMismatch
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  # Applied by the chart to config-init, redis, sentinel and split-brain-fix.
+  containerSecurityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    runAsNonRoot: true
+    readOnlyRootFilesystem: true   # only /data (PVC) is written
+    allowPrivilegeEscalation: false
+    seccompProfile:
+      type: RuntimeDefault
+    capabilities:
+      drop:
+        - ALL
+
+  persistentVolume:
+    enabled: true
+    size: 10Gi
+    storageClass: ~
+    accessModes:
+      - ReadWriteOnce
+
+  init:
+    resources:
+      requests: { cpu: 50m, memory: 32Mi }
+      limits: { cpu: 200m, memory: 64Mi }
+  splitBrainDetection:
+    resources:
+      requests: { cpu: 20m, memory: 32Mi }
+      limits: { cpu: 100m, memory: 64Mi }
+  configmapTest:
+    resources:
+      requests: { cpu: 20m, memory: 32Mi }
+      limits: { cpu: 200m, memory: 64Mi }
+
+  redis:
+    port: 6379
+    masterGroupName: mymaster
+    # Prefer ACL denial over rename-command. Renaming CONFIG/SLAVEOF/CLIENT/... breaks
+    # Sentinel, and the chart default (FLUSHDB/FLUSHALL) is already denied by ACL for
+    # every app user. Validated: Sentinel-required commands can never be listed here.
+    disableCommands: []
+
+    # Requests == limits (Guaranteed QoS for memory). maxmemory is derived from the limit.
+    resources:
+      requests: { cpu: 500m, memory: 4Gi }
+      limits: { cpu: "2", memory: 4Gi }
+
+    # Rendered into every node's redis.conf by the customConfig below. Every node gets
+    # the same values, so a replica never runs out of memory before the master.
+    config:
+      maxmemory: auto            # -> global.redisSecure.maxmemoryPercent of limits.memory
+      # noeviction  : safe default for persistent data (writes fail with OOM instead
+      #               of silently dropping keys).
+      # allkeys-lru / allkeys-lfu : pure cache.
+      # volatile-lru : mixed use (only keys with a TTL are evicted).
+      maxmemory-policy: noeviction
+      maxmemory-samples: 10
+      # Persistence: AOF (everysec, RDB preamble) for durability (at most about 1s of
+      # writes lost) plus periodic RDB snapshots for fast restarts and backups.
+      appendonly: "yes"
+      appendfsync: everysec
+      aof-use-rdb-preamble: "yes"
+      no-appendfsync-on-rewrite: "no"
+      auto-aof-rewrite-percentage: 100
+      auto-aof-rewrite-min-size: 64mb
+      save: "3600 1 300 100 60 10000"
+      rdbcompression: "yes"
+      rdbchecksum: "yes"
+      stop-writes-on-bgsave-error: "yes"
+      # Replication
+      repl-diskless-sync: "yes"
+      repl-diskless-sync-delay: 5
+      repl-backlog-size: 64mb
+      min-replicas-to-write: 1
+      min-replicas-max-lag: 10
+      # Output buffers are part of the 30% headroom. Keep the replica buffer small
+      # relative to the limit.
+      client-output-buffer-limit:
+        - "normal 0 0 0"
+        - "replica 256mb 64mb 60"
+        - "pubsub 32mb 8mb 60"
+      maxclients: 10000
+      tcp-keepalive: 300
+      timeout: 0
+      lazyfree-lazy-eviction: "yes"
+      lazyfree-lazy-expire: "yes"
+
+    # The chart ignores redis.config when customConfig is set, so customConfig
+    # re-renders redis.config (same loop as the chart) and adds the ACL wiring.
+    # tpl'd by the chart in the subchart context.
+    customConfig: |-
+      dir "/data"
+      port {{ .Values.redis.port }}
+      bind * -::*
+      protected-mode yes
+      enable-debug-command no
+      enable-module-command no
+      enable-protected-configs no
+      aclfile /etc/redis-secure/acl/users.acl
+      acl-pubsub-default resetchannels
+      acllog-max-len 256
+      {{- range $key, $value := .Values.redis.config }}
+      {{- if eq $key "maxmemory" }}
+      maxmemory {{ include "redis-ha-secure.maxmemory" $ }}
+      {{- else if kindIs "slice" $value }}
+      {{- range $value }}
+      {{ $key }} {{ . }}
+      {{- end }}
+      {{- else }}
+      {{ $key }} {{ $value }}
+      {{- end }}
+      {{- end }}
+      include /etc/redis-secure/acl/redis-infra.conf
+
+    # Linkerd: inject, and mark BOTH ports opaque (the annotation replaces the default list).
+    podAnnotations:
+      linkerd.io/inject: enabled
+      config.linkerd.io/opaque-ports: "6379,26379"
+      config.linkerd.io/default-inbound-policy: all-authenticated
+      config.linkerd.io/proxy-cpu-request: 50m
+      config.linkerd.io/proxy-cpu-limit: "1"
+      config.linkerd.io/proxy-memory-request: 64Mi
+      config.linkerd.io/proxy-memory-limit: 256Mi
+
+    terminationGracePeriodSeconds: 60
+    extraVolumeMounts:
+      - name: redis-acl
+        mountPath: /etc/redis-secure/acl
+        readOnly: true
+
+  sentinel:
+    port: 26379
+    quorum: 2
+    # Sentinel's own `default` user. Its password comes from the infra Secret. The
+    # chart scripts use it (-a $SENTINELAUTH), and Sentinels authenticate to each
+    # other with it in phase 1. Its rights are set in sentinel-users.acl.
+    auth: true
+    existingSecret: *infraSecretName
+    authKey: sentinel-default-password
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { cpu: 200m, memory: 64Mi }
+    config:
+      down-after-milliseconds: 10000
+      failover-timeout: 180000
+      parallel-syncs: 1
+      maxclients: 10000
+    customConfig: |-
+      dir "/data"
+      port {{ .Values.sentinel.port }}
+      protected-mode yes
+      aclfile /etc/redis-secure/sentinel-acl/sentinel-users.acl
+      requirepass replace-default-sentinel-auth
+      {{- range $key, $value := .Values.sentinel.config }}
+      {{- if eq "maxclients" $key }}
+      {{ $key }} {{ $value }}
+      {{- else }}
+      sentinel {{ $key }} {{ template "redis-ha.masterGroupName" $ }} {{ $value }}
+      {{- end }}
+      {{- end }}
+      include /etc/redis-secure/sentinel-acl/sentinel-infra.conf
+    extraVolumeMounts:
+      - name: sentinel-acl
+        mountPath: /etc/redis-secure/sentinel-acl
+        readOnly: true
+
+  # Directory mounts (NO subPath) so kubelet propagates Secret updates. `items`
+  # projects only what each container needs.
+  extraVolumes:
+    - name: redis-acl
+      secret:
+        secretName: *aclSecretName
+        defaultMode: 0440
+        items:
+          - { key: users.acl, path: users.acl }
+          - { key: redis-infra.conf, path: redis-infra.conf }
+    - name: sentinel-acl
+      secret:
+        secretName: *aclSecretName
+        defaultMode: 0440
+        items:
+          - { key: sentinel-users.acl, path: sentinel-users.acl }
+          - { key: sentinel-infra.conf, path: sentinel-infra.conf }
+
+  # The chart's exporter can only authenticate with the chart auth secret (default user)
+  # and no username, so we disable it and run redis_exporter as an extra container that
+  # logs in as exporter-user. acl-watch reports which ACL revision kubelet has mounted
+  # (read by the reload Job through `kubectl logs`), and it never loads anything itself.
+  exporter:
+    enabled: false
+  extraContainers:
+    - name: redis-exporter
+      image: quay.io/oliver006/redis_exporter:v1.97.0
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: REDIS_ADDR
+          value: redis://localhost:6379
+        - name: REDIS_USER
+          value: exporter-user
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: *infraSecretName
+              key: exporter-password
+      ports:
+        - name: http-metrics
+          containerPort: 9121
+      livenessProbe:
+        httpGet: { path: /health, port: http-metrics }
+        initialDelaySeconds: 15
+        periodSeconds: 15
+        timeoutSeconds: 3
+      readinessProbe:
+        httpGet: { path: /health, port: http-metrics }
+        initialDelaySeconds: 5
+        periodSeconds: 15
+        timeoutSeconds: 3
+      resources:
+        requests: { cpu: 20m, memory: 48Mi }
+        limits: { cpu: 200m, memory: 48Mi }
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        seccompProfile: { type: RuntimeDefault }
+        capabilities: { drop: [ALL] }
+    - name: acl-watch
+      image: public.ecr.aws/docker/library/redis:8.8.4-alpine
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          trap 'kill $! 2>/dev/null; exit 0' TERM INT
+          rev() { head -n1 "$1" 2>/dev/null | sed -n 's/^user acl-revision .*#\([0-9a-f]\{64\}\).*$/\1/p'; }
+          last=""; n=0
+          while true; do
+            cur="users=$(rev /etc/redis-secure/acl/users.acl) sentinel=$(rev /etc/redis-secure/sentinel-acl/sentinel-users.acl)"
+            if [ "$cur" != "$last" ] || [ $n -ge 60 ]; then echo "acl-revision $cur"; last="$cur"; n=0; fi
+            n=$((n+1)); sleep 5 & wait $!
+          done
+      volumeMounts:
+        - name: redis-acl
+          mountPath: /etc/redis-secure/acl
+          readOnly: true
+        - name: sentinel-acl
+          mountPath: /etc/redis-secure/sentinel-acl
+          readOnly: true
+      resources:
+        requests: { cpu: 5m, memory: 8Mi }
+        limits: { cpu: 50m, memory: 16Mi }
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        seccompProfile: { type: RuntimeDefault }
+        capabilities: { drop: [ALL] }
+
+  # Replaced by this chart's NetworkPolicy (client namespaces derived from aclUsers).
+  networkPolicy:
+    enabled: false
+
+  # ---------------------------------------------------------------------------
+  # HAProxy front door. DISABLED here; enable with values-haproxy.yaml (README
+  # "HAProxy mode"). In HAProxy mode clients ONLY talk to HAProxy (Linkerd +
+  # NetworkPolicy); Redis/Sentinel only accept the Redis pods, HAProxy and the ops Jobs.
+  # The customConfig below replaces the chart's built-in haproxy.cfg:
+  #  * health checks authenticate as `haproxy-user` (never `default`)
+  #  * init-state down    : no traffic to a server before its first successful check
+  #                         (the built-in config briefly routes to replicas on start)
+  #  * on-marked-down shutdown-sessions : client connections to a demoted master are
+  #                         closed immediately (no READONLY errors until timeout)
+  #  * quorum routing     : connections are refused unless >= 2 Sentinels agree on
+  #                         the master (no load-balancing between two "masters")
+  #  * readiness gating   : /healthz returns 503 until HAProxy has seen a master once
+  #                         (a broken config / auth never becomes Ready, so the
+  #                         rollout stalls while the old pods keep serving)
+  #  * TCP keepalive both sides, long tunnel timeout (idle pub/sub), maxconn bound
+  # The chart only injects $AUTH/$SENTINELAUTH into HAProxy, so haproxy-user's
+  # password is the `default-password` key (separate identity, shared secret).
+  # ---------------------------------------------------------------------------
+  haproxy:
+    enabled: false
+    replicas: 3
+    hardAntiAffinity: true
+    # The chart renders this PDB even when HAProxy is disabled. Set it together with
+    # haproxy.enabled (values-haproxy.yaml does): { maxUnavailable: 1 }.
+    podDisruptionBudget: {}
+    image:
+      repository: public.ecr.aws/docker/library/haproxy
+      tag: 3.3.17-alpine
+      pullPolicy: IfNotPresent
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits: { cpu: "1", memory: 128Mi }
+    init:
+      resources:
+        requests: { cpu: 20m, memory: 16Mi }
+        limits: { cpu: 100m, memory: 32Mi }
+    tests:
+      resources:
+        requests: { cpu: 20m, memory: 32Mi }
+        limits: { cpu: 100m, memory: 64Mi }
+    serviceAccount:
+      create: true
+      automountToken: false
+    service:
+      type: ClusterIP
+    # Health checks: 1s interval, DOWN after 2 consecutive failures (a single slow
+    # check, e.g. during a fork, must not drop every client connection).
+    checkInterval: 1s
+    checkFall: 2
+    timeout:
+      connect: 4s
+      server: 330s
+      client: 330s
+      check: 2s
+      # Established connections (TCP mode). Long enough for idle pub/sub subscribers;
+      # dead peers are detected by TCP keepalive (clitcpka/srvtcpka).
+      tunnel: 12h
+    metrics:
+      enabled: false
+      port: 9101
+      portName: http-exporter-port
+      scrapePath: /metrics
+    # Keep serving while the endpoint is removed from the Service, then stop.
+    lifecycle:
+      preStop:
+        exec:
+          command: ["/bin/sh", "-c", "sleep 10"]
+    securityContext:
+      runAsUser: 99
+      fsGroup: 99
+      runAsNonRoot: true
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      runAsNonRoot: true
+      readOnlyRootFilesystem: true
+      allowPrivilegeEscalation: false
+      seccompProfile:
+        type: RuntimeDefault
+      capabilities:
+        drop:
+          - ALL
+    podAnnotations:
+      linkerd.io/inject: enabled
+      # Both client-facing ports (6379, read-only 6380) are opaque Redis protocol.
+      config.linkerd.io/opaque-ports: "6379,6380"
+      config.linkerd.io/default-inbound-policy: all-authenticated
+      config.linkerd.io/proxy-cpu-request: 50m
+      config.linkerd.io/proxy-cpu-limit: "1"
+      config.linkerd.io/proxy-memory-request: 64Mi
+      config.linkerd.io/proxy-memory-limit: 256Mi
+    # tpl'd by the chart in the subchart context. Knobs: global.redisSecure.haproxy.
+    customConfig: |-
+      {{- $hs := ((.Values.global).redisSecure).haproxy | default dict }}
+      {{- $root := . }}
+      {{- $fullName := include "redis-ha.fullname" . }}
+      {{- $replicas := int (toString .Values.replicas) }}
+      {{- $masterGroupName := include "redis-ha.masterGroupName" . }}
+      {{- $user := "haproxy-user" }}
+      {{- $v6 := .Values.haproxy.IPv6.enabled }}
+      {{- $srv := printf "check inter %s fall %v rise 1 init-state down on-marked-down shutdown-sessions" .Values.haproxy.checkInterval .Values.haproxy.checkFall }}
+      {{- $quorum := "" }}
+      {{- range $i := until $replicas }}{{ $quorum = printf "%s%s{ srv_is_up(bk_redis_master/R%d) } { nbsrv(check_if_redis_is_master_%d) ge 2 }" $quorum (ternary "" " || " (eq $i 0)) $i $i }}{{ end }}
+      {{- $quorumRouting := ne (toString $hs.quorumRouting) "false" }}
+      global
+        maxconn {{ $hs.maxconn | default 3000 }}
+        {{- if $hs.logConnections }}
+        log stdout format raw local0 info
+        {{- end }}
+
+      defaults REDIS
+        mode tcp
+        {{- if $hs.logConnections }}
+        log global
+        option tcplog
+        {{- end }}
+        option dontlognull
+        option clitcpka
+        option srvtcpka
+        timeout connect {{ .Values.haproxy.timeout.connect }}
+        timeout server {{ .Values.haproxy.timeout.server }}
+        timeout client {{ .Values.haproxy.timeout.client }}
+        timeout check {{ .Values.haproxy.timeout.check }}
+        timeout tunnel {{ .Values.haproxy.timeout.tunnel }}
+
+      # Liveness + readiness (the chart probes /healthz on 8888 for both).
+      # 503 until HAProxy could route a client once: a master UP and, with quorum
+      # routing, >= 2 Sentinels agreeing (the exact routing condition). After that
+      # always 200, so failovers never fail liveness.
+      listen health_check_http_url
+        bind {{ if $v6 }}[::]{{ end }}:8888 {{ if $v6 }}v4v6{{ end }}
+        mode http
+        {{- if ne (toString $hs.readinessRequiresMaster) "false" }}
+        {{- if $quorumRouting }}
+        http-request set-var(proc.master_seen) bool(true) if {{ $quorum }}
+        {{- else }}
+        http-request set-var(proc.master_seen) bool(true) if { nbsrv(bk_redis_master) ge 1 }
+        {{- end }}
+        http-request return status 503 content-type text/plain string "no routable redis master seen yet" if !{ var(proc.master_seen) -m bool }
+        {{- end }}
+        http-request return status 200 content-type text/plain string "ok"
+
+      # One backend per Redis node: UP on a Sentinel when that Sentinel reports node i
+      # as master. nbsrv(check_if_redis_is_master_i) = number of Sentinels agreeing.
+      {{- range $i := until $replicas }}
+      backend check_if_redis_is_master_{{ $i }}
+        mode tcp
+        option tcp-check
+        tcp-check connect
+        tcp-check send "AUTH {{ $user }} ${AUTH}"\r\n
+        tcp-check expect string +OK
+        tcp-check send PING\r\n
+        tcp-check expect string +PONG
+        tcp-check send SENTINEL\ get-master-addr-by-name\ {{ $masterGroupName }}\r\n
+        tcp-check expect string REPLACE_ANNOUNCE{{ $i }}
+        # No QUIT here: Sentinel does not implement it (ERR unknown command).
+        {{- range $j := until $replicas }}
+        server R{{ $j }} {{ $fullName }}-announce-{{ $j }}:{{ $root.Values.sentinel.port }} check inter {{ $root.Values.haproxy.checkInterval }} rise 1 init-state down
+        {{- end }}
+      {{- end }}
+
+      frontend ft_redis_master
+        bind {{ if $v6 }}[::]{{ end }}:{{ .Values.haproxy.containerPort }} {{ if $v6 }}v4v6{{ end }}
+        maxconn {{ $hs.maxconn | default 3000 }}
+        use_backend bk_redis_master
+
+      backend bk_redis_master
+        mode tcp
+        option tcp-check
+        tcp-check connect
+        tcp-check send "AUTH {{ $user }} ${AUTH}"\r\n
+        tcp-check expect string +OK
+        tcp-check send PING\r\n
+        tcp-check expect string +PONG
+        tcp-check send info\ replication\r\n
+        tcp-check expect string role:master
+        tcp-check send QUIT\r\n
+        tcp-check expect string +OK
+        {{- if $quorumRouting }}
+        # Refuse the connection unless some node is UP (role:master) AND >= 2 Sentinels agree.
+        tcp-request content reject unless {{ $quorum }}
+        {{- end }}
+        {{- range $i := until $replicas }}
+        use-server R{{ $i }} if { srv_is_up(R{{ $i }}) } { nbsrv(check_if_redis_is_master_{{ $i }}) ge 2 }
+        server R{{ $i }} {{ $fullName }}-announce-{{ $i }}:{{ $root.Values.redis.port }} {{ $srv }}
+        {{- end }}
+      {{- if .Values.haproxy.readOnly.enabled }}
+
+      frontend ft_redis_replica
+        bind {{ if $v6 }}[::]{{ end }}:{{ .Values.haproxy.readOnly.port }} {{ if $v6 }}v4v6{{ end }}
+        maxconn {{ $hs.maxconn | default 3000 }}
+        use_backend bk_redis_replica
+
+      backend bk_redis_replica
+        mode tcp
+        balance leastconn
+        option tcp-check
+        tcp-check connect
+        tcp-check send "AUTH {{ $user }} ${AUTH}"\r\n
+        tcp-check expect string +OK
+        tcp-check send info\ replication\r\n
+        # master_link_status only exists on replicas, so this also proves role:slave.
+        tcp-check expect string master_link_status:up
+        tcp-check send QUIT\r\n
+        tcp-check expect string +OK
+        {{- range $i := until $replicas }}
+        server R{{ $i }} {{ $fullName }}-announce-{{ $i }}:{{ $root.Values.redis.port }} {{ $srv }}
+        {{- end }}
+      {{- end }}
+      {{- if .Values.haproxy.metrics.enabled }}
+
+      frontend metrics
+        mode http
+        bind {{ if $v6 }}[::]{{ end }}:{{ .Values.haproxy.metrics.port }} {{ if $v6 }}v4v6{{ end }}
+        http-request use-service prometheus-exporter if { path {{ .Values.haproxy.metrics.scrapePath }} }
+        http-request deny
+      {{- end }}

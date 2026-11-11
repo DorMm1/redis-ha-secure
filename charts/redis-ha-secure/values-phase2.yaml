@@ -1,0 +1,21 @@
+# Phase 2: dedicated least-privilege infrastructure users.
+#   replica-user   replication (masteruser/masterauth on EVERY node)
+#   sentinel-user  Sentinel -> Redis (sentinel auth-user/auth-pass on EVERY Sentinel)
+#   sentinel-peer  Sentinel -> Sentinel (sentinel sentinel-user/sentinel-pass)
+#   haproxy-user   HAProxy health checks (only if HAProxy is enabled)
+#   exporter-user  redis_exporter
+#   acl-admin      reload/drift Jobs, operators
+# The Redis and Sentinel `default` users become probe-only identities (the chart's
+# built-in probes/hooks can only authenticate as `default`, see README).
+#
+# The reload Job switches runtime auth, proves via CLIENT LIST that replication and
+# Sentinel use the new users, and only then runs ACL LOAD that demotes `default`.
+# Optional cautious path: first roll out with demoteDefault=false, then true.
+#
+#   helm upgrade redis charts/redis-ha-secure -n redis \
+#     -f charts/redis-ha-secure/values.yaml -f charts/redis-ha-secure/values-phase2.yaml \
+#     -f <your-env>/catalog.yaml
+acl:
+  phase: 2
+  phase2:
+    demoteDefault: true

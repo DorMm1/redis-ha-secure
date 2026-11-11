@@ -1,0 +1,28 @@
+# HAProxy mode: clients connect ONLY to the HAProxy Service (no Sentinel awareness
+# needed). Combine with a phase file:
+#
+#   helm upgrade --install redis-secure charts/redis-ha-secure -n redis-secure \
+#     -f charts/redis-ha-secure/values.yaml \
+#     -f charts/redis-ha-secure/values-haproxy.yaml \
+#     -f charts/redis-ha-secure/values-phase1.yaml \
+#     -f env/prod/catalog.yaml
+#
+# Every hardening detail lives in values.yaml (redis-ha.haproxy.customConfig and
+# global.redisSecure.haproxy); this file only switches the mode on.
+redis-ha:
+  haproxy:
+    enabled: true
+    replicas: 3
+    hardAntiAffinity: true
+    podDisruptionBudget:
+      maxUnavailable: 1
+    # maxUnavailable 1: works when replicas == schedulable nodes (hard anti-affinity
+    # leaves no room for a surge pod). Readiness gating still stops a broken rollout
+    # after ONE pod: the other replicas keep serving.
+    deploymentStrategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxSurge: 1
+        maxUnavailable: 1
+    metrics:
+      enabled: true

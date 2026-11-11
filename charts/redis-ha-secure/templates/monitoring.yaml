@@ -1,0 +1,232 @@
+{{- $full := include "redis-ha-secure.fullname" . -}}
+{{- $sub := index .Values "redis-ha" -}}
+{{- $sel := printf "namespace=%q, pod=~%q" .Release.Namespace (printf "%s-server-[0-9]+" (include "redis-ha-secure.redisFullname" .)) -}}
+{{- $m := .Values.monitoring.prometheusRule -}}
+{{- if .Values.monitoring.podMonitor.enabled }}
+# redis_exporter runs as an extra container (exporter-user), so the chart's own
+# ServiceMonitor is not used.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ $full }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.podMonitor.labels }}{{ toYaml . | nindent 4 }}{{ end }}
+spec:
+  selector:
+    matchLabels: {{- include "redis-ha-secure.redisSelector" . | nindent 6 }}
+  podMetricsEndpoints:
+    - port: http-metrics
+      path: /metrics
+      interval: {{ .Values.monitoring.podMonitor.interval }}
+{{- if and $sub.haproxy.enabled $sub.haproxy.metrics.enabled }}
+---
+# HAProxy built-in Prometheus exporter (frontend `metrics` in the custom config).
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ $full }}-haproxy
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.podMonitor.labels }}{{ toYaml . | nindent 4 }}{{ end }}
+spec:
+  selector:
+    matchLabels: {{- include "redis-ha-secure.haproxySelector" . | nindent 6 }}
+  podMetricsEndpoints:
+    - port: metrics-port
+      path: {{ $sub.haproxy.metrics.scrapePath }}
+      interval: {{ .Values.monitoring.podMonitor.interval }}
+{{- end }}
+{{- end }}
+{{- if $m.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ $full }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+    {{- with $m.labels }}{{ toYaml . | nindent 4 }}{{ end }}
+spec:
+  groups:
+    - name: {{ $full }}.redis
+      rules:
+        - alert: RedisDown
+          expr: redis_up{ {{- $sel -}} } == 0
+          for: 2m
+          labels: { severity: critical }
+          annotations:
+            summary: "Redis {{ "{{ $labels.pod }}" }} is down"
+        - alert: RedisMemoryHigh
+          expr: |
+            redis_memory_used_bytes{ {{- $sel -}} }
+              / (redis_memory_max_bytes{ {{- $sel -}} } > 0) > {{ $m.memoryUsedRatioWarning }}
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "Redis {{ "{{ $labels.pod }}" }} uses {{ "{{ $value | humanizePercentage }}" }} of maxmemory"
+            description: "Policy is {{ index $sub.redis.config "maxmemory-policy" }}. With noeviction, writes fail with OOM at 100%."
+        - alert: RedisOutOfMemoryErrors
+          expr: increase(redis_errors_total{ {{- $sel -}}, err="OOM"}[5m]) > 0
+          labels: { severity: critical }
+          annotations:
+            summary: "Redis {{ "{{ $labels.pod }}" }} rejected writes with OOM (maxmemory reached)"
+        {{- if ne (toString (index $sub.redis.config "maxmemory-policy")) "noeviction" }}
+        - alert: RedisEvictingKeys
+          expr: increase(redis_evicted_keys_total{ {{- $sel -}} }[5m]) > 0
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Redis {{ "{{ $labels.pod }}" }} is evicting keys ({{ index $sub.redis.config "maxmemory-policy" }})"
+        {{- end }}
+        - alert: RedisRejectedConnections
+          expr: increase(redis_rejected_connections_total{ {{- $sel -}} }[5m]) > 0
+          labels: { severity: warning }
+          annotations:
+            summary: "Redis {{ "{{ $labels.pod }}" }} rejected connections (maxclients)"
+        - alert: RedisMemoryFragmentationHigh
+          expr: |
+            redis_mem_fragmentation_ratio{ {{- $sel -}} } > {{ $m.fragmentationRatioWarning }}
+              and redis_memory_used_bytes{ {{- $sel -}} } > {{ int64 $m.fragmentationMinUsedBytes }}
+          for: 30m
+          labels: { severity: warning }
+          annotations:
+            summary: "Redis {{ "{{ $labels.pod }}" }} fragmentation ratio {{ "{{ $value }}" }} (consider activedefrag)"
+        - alert: RedisFailoverOccurred
+          expr: |
+            count(max by (pod) (max_over_time(redis_instance_info{ {{- $sel -}}, role="master"}[15m]))) > 1
+          labels: { severity: warning }
+          annotations:
+            summary: "Redis master changed in the last 15m (failover in {{ .Release.Namespace }})"
+        - alert: RedisNoOrMultipleMasters
+          expr: count(redis_instance_info{ {{- $sel -}}, role="master"}) != 1
+          for: 2m
+          labels: { severity: critical }
+          annotations:
+            summary: "{{ .Release.Namespace }}: {{ "{{ $value }}" }} Redis masters (expected exactly 1)"
+        - alert: RedisReplicationBroken
+          expr: redis_master_link_up{ {{- $sel -}} } == 0
+          for: 2m
+          labels: { severity: critical }
+          annotations:
+            summary: "Replica {{ "{{ $labels.pod }}" }} lost its master link"
+        - alert: RedisMissingReplicas
+          expr: redis_connected_slaves{ {{- $sel -}} } < {{ sub (int $sub.replicas) 1 }} and on (pod) redis_instance_info{ {{- $sel -}}, role="master"}
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Master {{ "{{ $labels.pod }}" }} has {{ "{{ $value }}" }} replicas (expected {{ sub (int $sub.replicas) 1 }})"
+        - alert: RedisAclAuthFailures
+          expr: sum by (pod) (increase(redis_acl_access_denied_auth_total{ {{- $sel -}} }[5m])) > 5
+          labels: { severity: warning }
+          annotations:
+            summary: "Redis {{ "{{ $labels.pod }}" }}: {{ "{{ $value }}" }} failed AUTH in 5m (wrong password, rotation, or probing). Inspect ACL LOG."
+        - alert: RedisAclPermissionDenied
+          expr: |
+            sum by (pod) (
+              increase(redis_acl_access_denied_cmd_total{ {{- $sel -}} }[5m])
+              + increase(redis_acl_access_denied_key_total{ {{- $sel -}} }[5m])
+              + increase(redis_acl_access_denied_channel_total{ {{- $sel -}} }[5m])
+            ) > 0
+          for: 5m
+          labels: { severity: info }
+          annotations:
+            summary: "Redis {{ "{{ $labels.pod }}" }}: ACL denied commands/keys/channels. Check ACL LOG (a missing grant, or misuse)."
+        {{- if and $m.driftCheckJobAlert .Values.acl.driftCheck.enabled }}
+        # Based on the LAST successful run, so one transient failure (for example during a
+        # node restart) clears with the next successful run instead of firing for as long
+        # as the failed Job stays in history.
+        - alert: RedisAclDriftCheckFailed
+          expr: |
+            time() - kube_cronjob_status_last_successful_time{namespace="{{ .Release.Namespace }}", cronjob="{{ $full }}-acl-drift"}
+              > {{ int $m.driftCheckMaxAgeSeconds }}
+          labels: { severity: warning }
+          annotations:
+            summary: "No successful ACL drift check for {{ "{{ $value | humanizeDuration }}" }}: nodes may differ from each other or from the ACL Secret. See the acl-drift Job logs."
+        - alert: RedisAclReloadFailed
+          expr: |
+            kube_job_status_failed{namespace="{{ .Release.Namespace }}", job_name="{{ $full }}-acl-reload"} > 0
+          labels: { severity: critical }
+          annotations:
+            summary: "The ACL reload Job failed. Nodes may still run the previous ACL revision."
+        {{- end }}
+        # Local persistence (AOF/RDB on the PVC). With stop-writes-on-bgsave-error yes a
+        # failing BGSAVE also stops writes.
+        - alert: RedisRdbSaveFailed
+          expr: redis_rdb_last_bgsave_status{ {{- $sel -}} } == 0
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "Redis {{ "{{ $labels.pod }}" }}: last BGSAVE failed (disk full / fork failure). Writes may be refused."
+        - alert: RedisAofWriteFailed
+          expr: redis_aof_last_write_status{ {{- $sel -}} } == 0 or redis_aof_last_bgrewrite_status{ {{- $sel -}} } == 0
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "Redis {{ "{{ $labels.pod }}" }}: AOF write or rewrite failed (disk full?). Durability is degraded."
+        {{- if .Values.dr.backup.enabled }}
+        - alert: RedisBackupMissing
+          expr: |
+            (time() - kube_cronjob_status_last_successful_time{namespace="{{ .Release.Namespace }}", cronjob="{{ $full }}-dr-backup"}
+              > {{ int $m.backupMaxAgeSeconds }})
+            or absent(kube_cronjob_status_last_successful_time{namespace="{{ .Release.Namespace }}", cronjob="{{ $full }}-dr-backup"})
+          for: 15m
+          labels: { severity: critical }
+          annotations:
+            summary: "No successful off-cluster Redis backup in {{ .Release.Namespace }} for over {{ int $m.backupMaxAgeSeconds }}s: the DR RPO is being exceeded. See the dr-backup Job logs."
+        {{- end }}
+        {{- if .Values.dr.restore.enabled }}
+        - alert: RedisDrRestoreStillEnabled
+          expr: vector(1)
+          for: 24h
+          labels: { severity: info }
+          annotations:
+            summary: "dr.restore is still enabled in {{ .Release.Namespace }} (backup {{ .Values.dr.restore.backupId }}). Remove values-dr-restore.yaml once the restore is verified."
+        {{- end }}
+    {{- if and $sub.haproxy.enabled $sub.haproxy.metrics.enabled }}
+    {{- $hsel := printf "namespace=%q, pod=~%q" .Release.Namespace (printf "%s-haproxy-.*" (include "redis-ha-secure.redisFullname" .)) }}
+    - name: {{ $full }}.haproxy
+      rules:
+        - alert: HAProxyNoRedisMaster
+          expr: haproxy_backend_active_servers{ {{- $hsel -}}, proxy="bk_redis_master"} == 0
+          for: 30s
+          labels: { severity: critical }
+          annotations:
+            summary: "HAProxy {{ "{{ $labels.pod }}" }} has no Redis master: clients cannot connect (failover in progress, or health-check auth broken)."
+        - alert: HAProxyMultipleRedisMasters
+          expr: haproxy_backend_active_servers{ {{- $hsel -}}, proxy="bk_redis_master"} > 1
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "HAProxy {{ "{{ $labels.pod }}" }} sees {{ "{{ $value }}" }} nodes with role:master (split brain). Quorum routing limits writes to the Sentinel-agreed master."
+        - alert: HAProxySentinelChecksDown
+          expr: sum by (pod) (haproxy_backend_active_servers{ {{- $hsel -}}, proxy=~"check_if_redis_is_master_.*"}) < 2
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "HAProxy {{ "{{ $labels.pod }}" }}: fewer than 2 Sentinels report a master. With quorum routing, new client connections are refused."
+        - alert: HAProxyPodsDisagree
+          expr: |
+            count(count by (proxy) (haproxy_backend_active_servers{ {{- $hsel -}}, proxy=~"check_if_redis_is_master_.*"} >= 2)) > 1
+          for: 2m
+          labels: { severity: warning }
+          annotations:
+            summary: "HAProxy pods route to different Redis masters for more than 2 minutes."
+        - alert: HAProxyConnectionsNearLimit
+          expr: |
+            haproxy_frontend_current_sessions{ {{- $hsel -}}, proxy="ft_redis_master"}
+              / haproxy_frontend_limit_sessions{ {{- $hsel -}}, proxy="ft_redis_master"} > 0.8
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "HAProxy {{ "{{ $labels.pod }}" }} uses {{ "{{ $value | humanizePercentage }}" }} of maxconn."
+        - alert: HAProxyRejectingConnections
+          expr: |
+            sum by (pod) (increase(haproxy_backend_requests_denied_total{ {{- $hsel -}}, proxy="bk_redis_master"}[5m])
+              + increase(haproxy_frontend_denied_connections_total{ {{- $hsel -}}, proxy="ft_redis_master"}[5m])) > 0
+          for: 2m
+          labels: { severity: warning }
+          annotations:
+            summary: "HAProxy {{ "{{ $labels.pod }}" }} refused client connections (no Sentinel-quorum master)."
+    {{- end }}
+{{- end }}

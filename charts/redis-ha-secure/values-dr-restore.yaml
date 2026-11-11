@@ -1,0 +1,65 @@
+# =============================================================================
+# DR bootstrap restore overlay (README "Disaster recovery", runbooks R1/R2).
+#   helm upgrade --install redis charts/redis-ha-secure -n redis \
+#     -f values.yaml -f values-phase2.yaml [-f values-haproxy.yaml] -f values-dr-restore.yaml \
+#     --set dr.restore.backupId=20261111T101500Z
+# Adds two init containers to EVERY Redis pod. They act only on an EMPTY data
+# directory: download <dr.storage.remote>/<backupId>/, verify SHA256SUMS +
+# redis-check-rdb, and install the snapshot as the AOF base. Pods with data skip them.
+# Remove this overlay after the restore is verified (one rolling restart; alert
+# RedisDrRestoreStillEnabled reminds you after 24h).
+# =============================================================================
+dr:
+  restore:
+    enabled: true
+    backupId: ""   # REQUIRED, explicit (cat <remote>/LATEST). 'latest' is rejected.
+
+redis-ha:
+  redis:
+    podAnnotations:
+      # Init containers need the network. With a native-sidecar proxy (Kubernetes >= 1.29)
+      # the Linkerd proxy runs before them; without it, meshed init containers cannot connect.
+      config.linkerd.io/proxy-enable-native-sidecar: "true"
+  # Not templated by the subchart: the names below must match dr.restore.configMapName
+  # and dr.storage.existingSecret (validated), and the install image must match
+  # redis-ha.image (same redis-check-rdb as the server).
+  extraInitContainers:
+    - name: dr-restore-fetch
+      image: docker.io/rclone/rclone:1.76.0
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-c", "$(DR_RESTORE_FETCH_SH)"]
+      envFrom:
+        - configMapRef: { name: redis-ha-dr-restore }
+        - secretRef: { name: redis-ha-dr-storage }
+      resources:
+        requests: { cpu: 100m, memory: 128Mi }
+        limits: { cpu: "1", memory: 512Mi }
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities: { drop: [ALL] }
+        seccompProfile: { type: RuntimeDefault }
+      volumeMounts:
+        - { name: data, mountPath: /data }
+    - name: dr-restore-install
+      image: public.ecr.aws/docker/library/redis:8.8.4-alpine
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-c", "$(DR_RESTORE_INSTALL_SH)"]
+      envFrom:
+        - configMapRef: { name: redis-ha-dr-restore }
+      resources:
+        requests: { cpu: 100m, memory: 64Mi }
+        limits: { cpu: "1", memory: 256Mi }
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities: { drop: [ALL] }
+        seccompProfile: { type: RuntimeDefault }
+      volumeMounts:
+        - { name: data, mountPath: /data }

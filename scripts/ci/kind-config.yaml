@@ -1,0 +1,17 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: redis-ha-secure
+# Calico instead of kindnet: kindnet's nftables-based NetworkPolicy engine does not
+# work on some kernels (for example Docker Desktop's WSL2 kernel), and the tests must
+# prove that NetworkPolicy is ENFORCED. See kind-up.sh.
+networking:
+  disableDefaultCNI: true
+  podSubnet: 192.168.0.0/16
+nodes:
+  - role: control-plane
+  - role: worker
+    labels: { topology.kubernetes.io/zone: zone-a }
+  - role: worker
+    labels: { topology.kubernetes.io/zone: zone-b }
+  - role: worker
+    labels: { topology.kubernetes.io/zone: zone-c }

@@ -1,0 +1,28 @@
+# Simulated "old prod": stock DandyDeveloper redis-ha 4.39.0 with HAProxy and a
+# requirepass (`default` user) from an existing Secret. Used by 08-migration-test.sh.
+auth: true
+existingSecret: legacy-redis-auth
+authKey: auth
+replicas: 3
+hardAntiAffinity: false
+persistentVolume:
+  size: 1Gi
+redis:
+  resources:
+    requests: { cpu: 50m, memory: 256Mi }
+    limits: { memory: 256Mi }
+  config:
+    maxmemory: 150mb
+sentinel:
+  resources:
+    requests: { cpu: 20m, memory: 32Mi }
+    limits: { memory: 64Mi }
+haproxy:
+  enabled: true
+  replicas: 2
+  hardAntiAffinity: false
+  # Stock config sets no maxconn: HAProxy derives ~500k from the fd limit and
+  # preallocates for it, so 64Mi gets OOMKilled. 256Mi is a realistic prod value.
+  resources:
+    requests: { cpu: 20m, memory: 128Mi }
+    limits: { memory: 256Mi }

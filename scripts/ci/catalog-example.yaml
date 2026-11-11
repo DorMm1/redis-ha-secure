@@ -1,0 +1,25 @@
+# Example catalog used by the tests (and a template for real environments).
+# Namespaces must exist before install (the build Job writes credential Secrets there).
+aclUsers:
+  # Read/write on its own prefix + publish/subscribe on its event channels.
+  # Password generated once by the build Job into orders/redis-acl-orders-api.
+  - namespace: orders
+    serviceAccount: orders-api
+    redis:
+      - keyPrefix: "orders:"
+        access: [read, write]
+      - channel: "orders.events.*"
+        access: [publish, subscribe]
+  # Pre-created password Secret (what External Secrets Operator would deliver).
+  # Read-only on orders:, write-only on reports:, subscribe-only, Lua allowed.
+  - namespace: reporting
+    serviceAccount: report-reader
+    passwordSecret: { name: reporting-redis, key: password }
+    scripting: true
+    redis:
+      - keyPrefix: "orders:"
+        access: [read]
+      - keyPrefix: "reports:"
+        access: [write]
+      - channel: "orders.events.*"
+        access: [subscribe]

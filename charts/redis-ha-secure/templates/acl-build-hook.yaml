@@ -1,0 +1,197 @@
+{{- include "redis-ha-secure.validate" . -}}
+{{- $full := include "redis-ha-secure.fullname" . -}}
+{{- $sub := index .Values "redis-ha" -}}
+{{- $sa := include "redis-ha-secure.buildServiceAccount" . -}}
+{{- $hookRbac := dict "helm.sh/hook" "pre-install,pre-upgrade,pre-rollback" "helm.sh/hook-weight" "-30" "helm.sh/hook-delete-policy" "before-hook-creation,hook-succeeded" -}}
+# ---------------------------------------------------------------------------
+# ACL build (pre-install / pre-upgrade hook). Runs BEFORE the StatefulSet exists or
+# changes, so pods always start with a valid aclfile. Argo CD maps these hooks to PreSync.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+  annotations: {{- toYaml $hookRbac | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $sa }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+  annotations: {{- toYaml $hookRbac | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ .Values.acl.secretName | quote }}, {{ .Values.infraCredentials.secretName | quote }}]
+    verbs: ["get", "patch", "update"]
+  # `create` cannot be restricted by resourceNames (first install only).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $sa }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+  annotations: {{- toYaml $hookRbac | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $sa }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ .Release.Namespace }}
+{{- /* One Role per client namespace: only the Secrets of that namespace's catalog users. */}}
+{{- $byNs := dict -}}
+{{- range .Values.aclUsers -}}
+{{- $names := get $byNs .namespace | default list -}}
+{{- $names = append $names (include "redis-ha-secure.credentialsSecret" .) -}}
+{{- if .passwordSecret -}}{{- $names = append $names .passwordSecret.name -}}{{- end -}}
+{{- $_ := set $byNs .namespace ($names | uniq) -}}
+{{- end -}}
+{{- $roleName := printf "%s-%s-acl-build" .Release.Namespace $full | trunc 63 | trimSuffix "-" -}}
+{{- range $ns, $names := $byNs }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $roleName }}
+  namespace: {{ $ns }}
+  labels: {{- include "redis-ha-secure.labels" $ | nindent 4 }}
+  annotations: {{- toYaml $hookRbac | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: {{ toJson $names }}
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $roleName }}
+  namespace: {{ $ns }}
+  labels: {{- include "redis-ha-secure.labels" $ | nindent 4 }}
+  annotations: {{- toYaml $hookRbac | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $roleName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $full }}-acl-build
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+  annotations: {{- toYaml $hookRbac | nindent 4 }}
+data:
+  # Rendered ACL rules. No secrets, so this is reviewable in git and in `helm template`.
+  catalog.tsv: |
+    {{- include "redis-ha-secure.catalog" . | nindent 4 }}
+  infra-keys.txt: |
+    {{- include "redis-ha-secure.requiredInfraKeys" . | nindent 4 }}
+  acl-build.sh: |
+    {{- .Files.Get "files/acl-build.sh" | nindent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $full }}-acl-build
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+    app.kubernetes.io/component: acl-build
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade,pre-rollback
+    helm.sh/hook-weight: "-20"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: {{ .Values.jobs.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ .Values.jobs.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels: {{- include "redis-ha-secure.labels" . | nindent 8 }}
+        app.kubernetes.io/component: acl-build
+      annotations:
+        # Talks only to the Kubernetes API, so it is not meshed.
+        linkerd.io/inject: disabled
+        checksum/catalog: {{ include "redis-ha-secure.catalog" . | sha256sum }}
+    spec:
+      serviceAccountName: {{ $sa }}
+      # The token is mounted explicitly below (short-lived projected token).
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext: {{- toYaml .Values.jobs.podSecurityContext | nindent 8 }}
+      {{- with .Values.jobs.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.jobs.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: acl-build
+          image: "{{ .Values.jobs.kubectlImage.repository }}:{{ .Values.jobs.kubectlImage.tag }}"
+          imagePullPolicy: {{ .Values.jobs.kubectlImage.pullPolicy }}
+          command: ["/bin/bash", "/catalog/acl-build.sh"]
+          env:
+            - { name: NAMESPACE, value: {{ .Release.Namespace | quote }} }
+            - { name: RELEASE, value: {{ .Release.Name | quote }} }
+            - { name: ACL_SECRET, value: {{ .Values.acl.secretName | quote }} }
+            - { name: INFRA_SECRET, value: {{ .Values.infraCredentials.secretName | quote }} }
+            - { name: GENERATE_INFRA, value: {{ .Values.infraCredentials.generate | toString | quote }} }
+            - { name: PHASE, value: {{ .Values.acl.phase | toString | quote }} }
+            - { name: DEMOTE_DEFAULT, value: {{ .Values.acl.phase2.demoteDefault | toString | quote }} }
+            - { name: MASTER_GROUP, value: {{ include "redis-ha-secure.masterGroupName" . | quote }} }
+            - { name: FULLNAME, value: {{ include "redis-ha-secure.redisFullname" . | quote }} }
+            - { name: REPLICAS, value: {{ $sub.replicas | toString | quote }} }
+            - { name: REDIS_PORT, value: {{ $sub.redis.port | toString | quote }} }
+            - { name: SENTINEL_PORT, value: {{ $sub.sentinel.port | toString | quote }} }
+            - { name: HAPROXY_ENABLED, value: {{ $sub.haproxy.enabled | toString | quote }} }
+            - { name: HAPROXY_PORT, value: {{ $sub.haproxy.servicePort | toString | quote }} }
+            - { name: KEY_DEFAULT, value: {{ .Values.infraCredentials.keys.default | quote }} }
+            - { name: KEY_SENTINEL_DEFAULT, value: {{ .Values.infraCredentials.keys.sentinelDefault | quote }} }
+            - { name: KEY_REPLICA, value: {{ .Values.infraCredentials.keys.replica | quote }} }
+            - { name: KEY_SENTINEL_USER, value: {{ .Values.infraCredentials.keys.sentinelUser | quote }} }
+            - { name: KEY_SENTINEL_PEER, value: {{ .Values.infraCredentials.keys.sentinelPeer | quote }} }
+          resources: {{- toYaml .Values.jobs.resources | nindent 12 }}
+          securityContext: {{- toYaml .Values.jobs.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - { name: catalog, mountPath: /catalog, readOnly: true }
+            - { name: work, mountPath: /work }
+            - { name: tmp, mountPath: /tmp }
+            - { name: token, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true }
+      volumes:
+        - name: catalog
+          configMap:
+            name: {{ $full }}-acl-build
+        # Plaintext passwords only ever touch memory.
+        - name: work
+          emptyDir: { medium: Memory, sizeLimit: 16Mi }
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+        - name: token
+          projected:
+            sources:
+              - serviceAccountToken: { path: token, expirationSeconds: 3600 }
+              - configMap:
+                  name: kube-root-ca.crt
+                  items: [{ key: ca.crt, path: ca.crt }]
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef: { fieldPath: metadata.namespace }

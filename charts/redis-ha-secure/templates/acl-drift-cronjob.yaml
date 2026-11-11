@@ -1,0 +1,30 @@
+{{- if .Values.acl.driftCheck.enabled }}
+{{- $full := include "redis-ha-secure.fullname" . }}
+# Diffs ACL LIST across all nodes and against the expected file. A failed Job is the
+# signal (PrometheusRule RedisAclDriftCheckFailed).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $full }}-acl-drift
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+    app.kubernetes.io/component: acl-drift
+spec:
+  schedule: {{ .Values.acl.driftCheck.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        app.kubernetes.io/component: acl-drift
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 300
+      ttlSecondsAfterFinished: {{ .Values.jobs.ttlSecondsAfterFinished }}
+      template:
+        metadata:
+          {{- include "redis-ha-secure.opsPodMeta" (dict "root" . "component" "acl-drift") | nindent 10 }}
+        spec:
+          {{- include "redis-ha-secure.opsPodSpec" (dict "root" . "mode" "report" "script" "acl-drift.sh") | nindent 10 }}
+{{- end }}

@@ -1,0 +1,64 @@
+# Overrides for Docker Desktop's built-in Kubernetes (single node, Linkerd installed,
+# no Prometheus Operator, NetworkPolicy NOT enforced by its CNI). This is where the
+# Linkerd authorization path is validated (Linkerd enforces per-ServiceAccount access).
+linkerd:
+  enabled: true
+monitoring:
+  podMonitor:
+    enabled: false
+  prometheusRule:
+    enabled: false
+redis-ha:
+  # single node: anti-affinity cannot be satisfied
+  hardAntiAffinity: false
+  topologySpreadConstraints:
+    enabled: false
+  persistentVolume:
+    size: 1Gi
+  redis:
+    resources:
+      requests: { cpu: 100m, memory: 512Mi }
+      limits: { cpu: "1", memory: 512Mi }
+    readinessProbe:
+      initialDelaySeconds: 10
+      periodSeconds: 5
+    livenessProbe:
+      initialDelaySeconds: 10
+    startupProbe:
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      failureThreshold: 30
+  sentinel:
+    readinessProbe:
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      successThreshold: 1
+    config:
+      down-after-milliseconds: 5000
+      failover-timeout: 60000
+      parallel-syncs: 1
+      maxclients: 10000
+  haproxy:
+    hardAntiAffinity: false
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { cpu: "1", memory: 128Mi }
+aclUsers:
+  - namespace: orders
+    serviceAccount: orders-api
+    redis:
+      - keyPrefix: "orders:"
+        access: [read, write]
+      - channel: "orders.events.*"
+        access: [publish, subscribe]
+  - namespace: reporting
+    serviceAccount: report-reader
+    passwordSecret: { name: reporting-redis, key: password }
+    scripting: true
+    redis:
+      - keyPrefix: "orders:"
+        access: [read]
+      - keyPrefix: "reports:"
+        access: [write]
+      - channel: "orders.events.*"
+        access: [subscribe]

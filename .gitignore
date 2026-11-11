@@ -1,0 +1,8 @@
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+# local test output
+*.log
+*.tmp

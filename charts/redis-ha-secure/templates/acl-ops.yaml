@@ -1,0 +1,59 @@
+{{- $full := include "redis-ha-secure.fullname" . -}}
+{{- $sub := index .Values "redis-ha" -}}
+{{- if or .Values.acl.reload.enabled .Values.acl.driftCheck.enabled }}
+# Identity of the reload Job / drift CronJob: Redis access (as acl-admin) + read-only
+# `kubectl logs` of the acl-watch sidecars. No Secret access through the API.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "redis-ha-secure.opsServiceAccount" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "redis-ha-secure.opsServiceAccount" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    resourceNames:
+      {{- range $i := until (int $sub.replicas) }}
+      - {{ include "redis-ha-secure.redisFullname" $ }}-server-{{ $i }}
+      {{- end }}
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "redis-ha-secure.opsServiceAccount" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "redis-ha-secure.opsServiceAccount" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "redis-ha-secure.opsServiceAccount" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $full }}-acl-scripts
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+data:
+  acl-lib.sh: |
+    {{- .Files.Get "files/acl-lib.sh" | nindent 4 }}
+  acl-reload.sh: |
+    {{- .Files.Get "files/acl-reload.sh" | nindent 4 }}
+  acl-drift.sh: |
+    {{- .Files.Get "files/acl-drift.sh" | nindent 4 }}
+  wait-for-mount.sh: |
+    {{- .Files.Get "files/wait-for-mount.sh" | nindent 4 }}
+{{- end }}

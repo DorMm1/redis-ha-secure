@@ -1,0 +1,9 @@
+# Phase 1: app users from the catalog. `default` keeps full rights (password = infra
+# Secret key default-password) and is used ONLY by Sentinel, replication and the chart
+# probes. Failover behaviour is identical to a stock redis-ha install.
+#
+#   helm upgrade --install redis charts/redis-ha-secure -n redis \
+#     -f charts/redis-ha-secure/values.yaml -f charts/redis-ha-secure/values-phase1.yaml \
+#     -f <your-env>/catalog.yaml
+acl:
+  phase: 1

@@ -1,0 +1,160 @@
+{{- if .Values.migration.enabled }}
+{{- $full := include "redis-ha-secure.fullname" . -}}
+{{- $sub := index .Values "redis-ha" -}}
+{{- $m := .Values.migration -}}
+# =============================================================================
+# Live migration: old cluster -> this release (RedisShake sync_reader + redis_writer).
+# The reader replicates from the old master (PSYNC: RDB snapshot, then the live
+# write stream). The writer replays into this cluster through HAProxy as
+# migration-user. Passwords only come from env (Secrets). RedisShake substitutes
+# ${VAR} in the TOML, so the ConfigMap holds no secret.
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "redis-ha-secure.migrationServiceAccount" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $full }}-migration
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+data:
+  shake.toml: |
+    [sync_reader]
+    cluster = false
+    address = {{ $m.source.address | quote }}
+    {{- if $m.source.username }}
+    username = {{ $m.source.username | quote }}
+    {{- end }}
+    password = "${SHAKE_SRC_PASSWORD}"
+    tls = {{ $m.source.tls }}
+    sync_rdb = true
+    sync_aof = true
+    prefer_replica = false
+    try_diskless = false
+
+    [redis_writer]
+    cluster = false
+    address = "{{ include "redis-ha-secure.redisFullname" . }}-haproxy.{{ .Release.Namespace }}.svc:{{ $sub.haproxy.servicePort }}"
+    username = "migration-user"
+    password = "${SHAKE_DST_PASSWORD}"
+    tls = false
+    off_reply = false
+
+    [filter]
+    allow_key_prefix = {{ $m.filter.allowKeyPrefixes | default list | toJson }}
+    block_key_prefix = {{ $m.filter.blockKeyPrefixes | default list | toJson }}
+    allow_db = {{ $m.filter.allowDbs | default list | toJson }}
+    block_db = {{ $m.filter.blockDbs | default list | toJson }}
+    block_command = ["PUBLISH", "SPUBLISH"]
+    block_command_group = ["SCRIPTING"]
+
+    [advanced]
+    dir = "/data"
+    ncpu = 0
+    pprof_port = 0
+    status_port = 0
+    log_file = "shake.log"
+    log_level = "info"
+    log_interval = 5
+    log_rotation = true
+    log_max_size = 64
+    log_max_age = 1
+    log_max_backups = 1
+    log_compress = false
+    rdb_restore_command_behavior = {{ $m.restoreBehavior | quote }}
+    pipeline_count_limit = 1024
+    target_redis_max_qps = {{ int $m.targetMaxQps }}
+    target_redis_client_max_querybuf_len = 1073741824
+    target_redis_proto_max_bulk_len = 512_000_000
+    empty_db_before_sync = false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $full }}-migration
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migration
+spec:
+  replicas: 1
+  # Never two writers at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: migration
+  template:
+    metadata:
+      labels:
+        {{- include "redis-ha-secure.labels" . | nindent 8 }}
+        {{- include "redis-ha-secure.jobClientLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migration
+      annotations:
+        checksum/config: {{ toJson $m | sha256sum }}
+        {{- with $m.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "redis-ha-secure.migrationServiceAccount" . }}
+      automountServiceAccountToken: false
+      securityContext: {{- toYaml .Values.jobs.podSecurityContext | nindent 8 }}
+      {{- with .Values.jobs.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.jobs.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: redis-shake
+          image: "{{ $m.image.repository }}:{{ $m.image.tag }}"
+          imagePullPolicy: {{ $m.image.pullPolicy }}
+          # Supervising loop instead of crash-looping: migration-user only exists once the
+          # post-upgrade reload Job has run (after `helm --wait`), and every RedisShake
+          # restart is an idempotent full resync (restoreBehavior: rewrite).
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              trap 'kill "$pid" 2>/dev/null; wait "$pid"; exit 0' TERM INT
+              n=0
+              while true; do
+                /app/redis-shake /config/shake.toml & pid=$!
+                wait "$pid"; rc=$?
+                n=$((n + 1))
+                echo "redis-shake exited rc=$rc (run $n); restarting in 15s"
+                sleep 15 & wait $!
+              done
+          workingDir: /data
+          env:
+            - name: SHAKE_SRC_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $m.source.passwordSecret.name }}
+                  key: {{ $m.source.passwordSecret.key }}
+            - name: SHAKE_DST_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.infraCredentials.secretName }}
+                  key: {{ .Values.infraCredentials.keys.migration }}
+          resources: {{- toYaml $m.resources | nindent 12 }}
+          securityContext: {{- toYaml .Values.jobs.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - { name: config, mountPath: /config, readOnly: true }
+            - { name: data, mountPath: /data }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $full }}-migration
+        # RDB spool + logs. Size it for the old dataset's RDB.
+        - name: data
+          emptyDir: { sizeLimit: 20Gi }
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+{{- end }}

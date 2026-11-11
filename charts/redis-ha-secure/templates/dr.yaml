@@ -1,0 +1,159 @@
+{{- $full := include "redis-ha-secure.fullname" . -}}
+{{- $sub := index .Values "redis-ha" -}}
+{{- $dr := .Values.dr -}}
+{{- $rimg := printf "%s:%s" $dr.storage.image.repository $dr.storage.image.tag -}}
+{{- if $dr.backup.enabled }}
+# =============================================================================
+# Disaster recovery: off-cluster RDB backups.
+#   snapshot (init, Redis image): redis-cli --rdb as backup-user from the freshest
+#            connected replica, redis-check-rdb, SHA256SUMS + metadata
+#   upload   (rclone image):     copy to <dr.storage.remote>/<backup-id>/, verify,
+#            update LATEST, retention (never below keepLast)
+# Storage credentials only come from the pre-created rclone env Secret.
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "redis-ha-secure.drBackupServiceAccount" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $full }}-dr-scripts
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+data:
+  dr-snapshot.sh: |
+    {{- .Files.Get "files/dr-snapshot.sh" | nindent 4 }}
+  dr-upload.sh: |
+    {{- .Files.Get "files/dr-upload.sh" | nindent 4 }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $full }}-dr-backup
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dr-backup
+spec:
+  schedule: {{ $dr.backup.schedule | quote }}
+  {{- with $dr.backup.timeZone }}
+  timeZone: {{ . | quote }}
+  {{- end }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        app.kubernetes.io/component: dr-backup
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: {{ int $dr.backup.activeDeadlineSeconds }}
+      ttlSecondsAfterFinished: {{ .Values.jobs.ttlSecondsAfterFinished }}
+      template:
+        metadata:
+          labels:
+            {{- include "redis-ha-secure.labels" . | nindent 12 }}
+            {{- include "redis-ha-secure.jobClientLabels" . | nindent 12 }}
+            app.kubernetes.io/component: dr-backup
+          annotations:
+            checksum/scripts: {{ printf "%s%s" (.Files.Get "files/dr-snapshot.sh") (.Files.Get "files/dr-upload.sh") | sha256sum | trunc 16 }}
+            {{- with $dr.backup.podAnnotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        spec:
+          serviceAccountName: {{ include "redis-ha-secure.drBackupServiceAccount" . }}
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          securityContext: {{- toYaml .Values.jobs.podSecurityContext | nindent 12 }}
+          {{- with .Values.jobs.nodeSelector }}
+          nodeSelector: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.jobs.tolerations }}
+          tolerations: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          initContainers:
+            - name: snapshot
+              image: "{{ $sub.image.repository }}:{{ $sub.image.tag }}"
+              imagePullPolicy: {{ $sub.image.pullPolicy }}
+              command: ["/bin/sh", "/scripts/dr-snapshot.sh"]
+              env:
+                - { name: NAMESPACE, value: {{ .Release.Namespace | quote }} }
+                - { name: FULLNAME, value: {{ include "redis-ha-secure.redisFullname" . | quote }} }
+                - { name: REPLICAS, value: {{ $sub.replicas | toString | quote }} }
+                - { name: REDIS_PORT, value: {{ $sub.redis.port | toString | quote }} }
+                - { name: SOURCE, value: {{ $dr.backup.source | quote }} }
+                - { name: SNAPSHOT_TIMEOUT_SECONDS, value: {{ $dr.backup.snapshotTimeoutSeconds | toString | quote }} }
+                - name: BACKUP_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.infraCredentials.secretName }}
+                      key: {{ .Values.infraCredentials.keys.backup }}
+              resources: {{- toYaml $dr.backup.resources.snapshot | nindent 16 }}
+              securityContext: {{- toYaml .Values.jobs.containerSecurityContext | nindent 16 }}
+              volumeMounts:
+                - { name: scripts, mountPath: /scripts, readOnly: true }
+                - { name: spool, mountPath: /spool }
+                - { name: tmp, mountPath: /tmp }
+          containers:
+            - name: upload
+              image: {{ $rimg | quote }}
+              imagePullPolicy: {{ $dr.storage.image.pullPolicy }}
+              command: ["/bin/sh", "/scripts/dr-upload.sh"]
+              env:
+                - { name: DR_REMOTE, value: {{ $dr.storage.remote | quote }} }
+                - { name: RETENTION_DAYS, value: {{ $dr.backup.retention.days | toString | quote }} }
+                - { name: RETENTION_KEEP_LAST, value: {{ $dr.backup.retention.keepLast | toString | quote }} }
+                - { name: RCLONE_CONFIG, value: /tmp/no-rclone.conf }
+                - { name: RCLONE_CACHE_DIR, value: /tmp/rclone-cache }
+                - { name: HOME, value: /tmp }
+              envFrom:
+                - secretRef:
+                    name: {{ $dr.storage.existingSecret }}
+              resources: {{- toYaml $dr.backup.resources.upload | nindent 16 }}
+              securityContext: {{- toYaml .Values.jobs.containerSecurityContext | nindent 16 }}
+              volumeMounts:
+                - { name: scripts, mountPath: /scripts, readOnly: true }
+                - { name: spool, mountPath: /spool, readOnly: true }
+                - { name: tmp, mountPath: /tmp }
+          volumes:
+            - name: scripts
+              configMap:
+                name: {{ $full }}-dr-scripts
+            # Holds one RDB. Size it for the dataset (RDB is usually 20-50 % of used_memory).
+            - name: spool
+              emptyDir: { sizeLimit: {{ $dr.backup.spoolSizeLimit }} }
+            - name: tmp
+              emptyDir: { sizeLimit: 64Mi }
+{{- end }}
+{{- if $dr.restore.enabled }}
+---
+# =============================================================================
+# Disaster recovery: bootstrap restore. Consumed by the dr-restore-* init containers
+# that values-dr-restore.yaml adds to EVERY Redis pod (redis-ha.extraInitContainers is
+# not templated by the subchart, hence a fixed ConfigMap name). Pods with existing data
+# ignore it.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $dr.restore.configMapName }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dr-restore
+data:
+  DR_REMOTE: {{ $dr.storage.remote | quote }}
+  DR_BACKUP_ID: {{ $dr.restore.backupId | quote }}
+  RCLONE_CONFIG: /data/.dr-restore-no-rclone.conf
+  RCLONE_CACHE_DIR: /data/.dr-restore/.cache
+  HOME: /data/.dr-restore
+  DR_RESTORE_FETCH_SH: |
+    {{- .Files.Get "files/dr-restore-fetch.sh" | nindent 4 }}
+  DR_RESTORE_INSTALL_SH: |
+    {{- .Files.Get "files/dr-restore-install.sh" | nindent 4 }}
+{{- end }}

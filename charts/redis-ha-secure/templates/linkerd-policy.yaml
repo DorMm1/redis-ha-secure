@@ -1,0 +1,332 @@
+{{- if .Values.linkerd.enabled }}
+{{- $sub := index .Values "redis-ha" -}}
+{{- $full := include "redis-ha-secure.fullname" . -}}
+{{- $sv := .Values.linkerd.serverApiVersion -}}
+{{- $pv := .Values.linkerd.policyApiVersion -}}
+{{- $root := . -}}
+# =============================================================================
+# Linkerd authorization. Once a Server exists for a port, ONLY explicitly authorized
+# identities may connect (mTLS ServiceAccount identity).
+#   redis-intra   : the Redis pods themselves (replication + Sentinel), HAProxy, the ops Jobs
+#   redis-clients : one identity per aclUsers entry (1:1 with the Redis ACL users)
+# =============================================================================
+apiVersion: {{ $sv }}
+kind: Server
+metadata:
+  name: {{ $full }}-redis
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "redis-ha-secure.redisSelector" . | nindent 6 }}
+  port: redis
+  proxyProtocol: opaque
+---
+apiVersion: {{ $sv }}
+kind: Server
+metadata:
+  name: {{ $full }}-sentinel
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "redis-ha-secure.redisSelector" . | nindent 6 }}
+  port: sentinel
+  proxyProtocol: opaque
+---
+apiVersion: {{ $sv }}
+kind: Server
+metadata:
+  name: {{ $full }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "redis-ha-secure.redisSelector" . | nindent 6 }}
+  port: http-metrics
+  proxyProtocol: HTTP/1
+---
+apiVersion: {{ $pv }}
+kind: MeshTLSAuthentication
+metadata:
+  name: {{ $full }}-intra
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+spec:
+  identityRefs:
+    - kind: ServiceAccount
+      name: {{ include "redis-ha-secure.redisServiceAccount" . }}
+    - kind: ServiceAccount
+      name: {{ include "redis-ha-secure.opsServiceAccount" . }}
+    {{- if $sub.haproxy.enabled }}
+    - kind: ServiceAccount
+      name: {{ include "redis-ha-secure.haproxyServiceAccount" . }}
+    {{- end }}
+{{- $clients := list -}}
+{{- range .Values.aclUsers -}}{{- $clients = append $clients (dict "name" .serviceAccount "namespace" .namespace) -}}{{- end -}}
+{{- range .Values.linkerd.extraClients -}}{{- $clients = append $clients (dict "name" .name "namespace" .namespace) -}}{{- end -}}
+{{- if $clients }}
+---
+apiVersion: {{ $pv }}
+kind: MeshTLSAuthentication
+metadata:
+  name: {{ $full }}-clients
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+spec:
+  identityRefs:
+    {{- range $clients }}
+    - kind: ServiceAccount
+      name: {{ .name }}
+      namespace: {{ .namespace }}
+    {{- end }}
+{{- end }}
+{{- $redisPorts := list "redis" "sentinel" -}}
+{{- range $port := $redisPorts }}
+---
+apiVersion: {{ $pv }}
+kind: AuthorizationPolicy
+metadata:
+  name: {{ $full }}-{{ $port }}-intra
+  namespace: {{ $root.Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" $root | nindent 4 }}
+spec:
+  targetRef:
+    group: policy.linkerd.io
+    kind: Server
+    name: {{ $full }}-{{ $port }}
+  requiredAuthenticationRefs:
+    - group: policy.linkerd.io
+      kind: MeshTLSAuthentication
+      name: {{ $full }}-intra
+{{- if and $clients (not $sub.haproxy.enabled) }}
+---
+apiVersion: {{ $pv }}
+kind: AuthorizationPolicy
+metadata:
+  name: {{ $full }}-{{ $port }}-clients
+  namespace: {{ $root.Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" $root | nindent 4 }}
+spec:
+  targetRef:
+    group: policy.linkerd.io
+    kind: Server
+    name: {{ $full }}-{{ $port }}
+  requiredAuthenticationRefs:
+    - group: policy.linkerd.io
+      kind: MeshTLSAuthentication
+      name: {{ $full }}-clients
+{{- end }}
+{{- end }}
+{{- if .Values.dr.backup.enabled }}
+---
+# DR backup Job: Redis port only (redis-cli --rdb as backup-user), never Sentinel.
+apiVersion: {{ $pv }}
+kind: MeshTLSAuthentication
+metadata:
+  name: {{ $full }}-dr-backup
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+spec:
+  identityRefs:
+    - kind: ServiceAccount
+      name: {{ include "redis-ha-secure.drBackupServiceAccount" . }}
+---
+apiVersion: {{ $pv }}
+kind: AuthorizationPolicy
+metadata:
+  name: {{ $full }}-redis-dr-backup
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+spec:
+  targetRef:
+    group: policy.linkerd.io
+    kind: Server
+    name: {{ $full }}-redis
+  requiredAuthenticationRefs:
+    - group: policy.linkerd.io
+      kind: MeshTLSAuthentication
+      name: {{ $full }}-dr-backup
+{{- end }}
+{{- /* ---------------- monitoring (exporter) ---------------- */}}
+{{- with .Values.linkerd.monitoring.serviceAccounts }}
+---
+apiVersion: {{ $pv }}
+kind: MeshTLSAuthentication
+metadata:
+  name: {{ $full }}-monitoring
+  namespace: {{ $root.Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" $root | nindent 4 }}
+spec:
+  identityRefs:
+    {{- range . }}
+    - kind: ServiceAccount
+      name: {{ .name }}
+      namespace: {{ .namespace }}
+    {{- end }}
+---
+apiVersion: {{ $pv }}
+kind: AuthorizationPolicy
+metadata:
+  name: {{ $full }}-metrics-mesh
+  namespace: {{ $root.Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" $root | nindent 4 }}
+spec:
+  targetRef:
+    group: policy.linkerd.io
+    kind: Server
+    name: {{ $full }}-metrics
+  requiredAuthenticationRefs:
+    - group: policy.linkerd.io
+      kind: MeshTLSAuthentication
+      name: {{ $full }}-monitoring
+{{- end }}
+{{- with .Values.linkerd.monitoring.networks }}
+---
+apiVersion: {{ $pv }}
+kind: NetworkAuthentication
+metadata:
+  name: {{ $full }}-monitoring
+  namespace: {{ $root.Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" $root | nindent 4 }}
+spec:
+  networks: {{- toYaml . | nindent 4 }}
+---
+apiVersion: {{ $pv }}
+kind: AuthorizationPolicy
+metadata:
+  name: {{ $full }}-metrics-network
+  namespace: {{ $root.Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" $root | nindent 4 }}
+spec:
+  targetRef:
+    group: policy.linkerd.io
+    kind: Server
+    name: {{ $full }}-metrics
+  requiredAuthenticationRefs:
+    - group: policy.linkerd.io
+      kind: NetworkAuthentication
+      name: {{ $full }}-monitoring
+{{- end }}
+{{- /* ---------------- HAProxy front door ---------------- */}}
+{{- if $sub.haproxy.enabled }}
+{{- $hports := list (dict "name" "haproxy" "port" "redis") -}}
+{{- if $sub.haproxy.readOnly.enabled }}{{ $hports = append $hports (dict "name" "haproxy-ro" "port" "readonlyport") }}{{ end }}
+{{- range $hports }}
+---
+# Client entry point. Clients are authorized per ServiceAccount (catalog). Redis itself
+# then authorizes per ACL user; Redis/Sentinel only accept the -intra identities.
+apiVersion: {{ $sv }}
+kind: Server
+metadata:
+  name: {{ $full }}-{{ .name }}
+  namespace: {{ $root.Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" $root | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "redis-ha-secure.haproxySelector" $root | nindent 6 }}
+  port: {{ .port }}
+  proxyProtocol: opaque
+{{- if $clients }}
+---
+apiVersion: {{ $pv }}
+kind: AuthorizationPolicy
+metadata:
+  name: {{ $full }}-{{ .name }}-clients
+  namespace: {{ $root.Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" $root | nindent 4 }}
+spec:
+  targetRef:
+    group: policy.linkerd.io
+    kind: Server
+    name: {{ $full }}-{{ .name }}
+  requiredAuthenticationRefs:
+    - group: policy.linkerd.io
+      kind: MeshTLSAuthentication
+      name: {{ $full }}-clients
+{{- end }}
+---
+apiVersion: {{ $pv }}
+kind: AuthorizationPolicy
+metadata:
+  name: {{ $full }}-{{ .name }}-internal
+  namespace: {{ $root.Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" $root | nindent 4 }}
+spec:
+  targetRef:
+    group: policy.linkerd.io
+    kind: Server
+    name: {{ $full }}-{{ .name }}
+  requiredAuthenticationRefs:
+    - group: policy.linkerd.io
+      kind: MeshTLSAuthentication
+      name: {{ $full }}-release-clients
+{{- end }}
+---
+# Release-internal HAProxy users: ops Jobs and the RedisShake migration writer.
+apiVersion: {{ $pv }}
+kind: MeshTLSAuthentication
+metadata:
+  name: {{ $full }}-release-clients
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+spec:
+  identityRefs:
+    - kind: ServiceAccount
+      name: {{ include "redis-ha-secure.opsServiceAccount" . }}
+    {{- if .Values.migration.enabled }}
+    - kind: ServiceAccount
+      name: {{ include "redis-ha-secure.migrationServiceAccount" . }}
+    {{- end }}
+{{- if $sub.haproxy.metrics.enabled }}
+---
+apiVersion: {{ $sv }}
+kind: Server
+metadata:
+  name: {{ $full }}-haproxy-metrics
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "redis-ha-secure.haproxySelector" . | nindent 6 }}
+  port: metrics-port
+  proxyProtocol: HTTP/1
+{{- if .Values.linkerd.monitoring.serviceAccounts }}
+---
+apiVersion: {{ $pv }}
+kind: AuthorizationPolicy
+metadata:
+  name: {{ $full }}-haproxy-metrics-mesh
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+spec:
+  targetRef:
+    group: policy.linkerd.io
+    kind: Server
+    name: {{ $full }}-haproxy-metrics
+  requiredAuthenticationRefs:
+    - group: policy.linkerd.io
+      kind: MeshTLSAuthentication
+      name: {{ $full }}-monitoring
+{{- end }}
+{{- if .Values.linkerd.monitoring.networks }}
+---
+apiVersion: {{ $pv }}
+kind: AuthorizationPolicy
+metadata:
+  name: {{ $full }}-haproxy-metrics-network
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+spec:
+  targetRef:
+    group: policy.linkerd.io
+    kind: Server
+    name: {{ $full }}-haproxy-metrics
+  requiredAuthenticationRefs:
+    - group: policy.linkerd.io
+      kind: NetworkAuthentication
+      name: {{ $full }}-monitoring
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

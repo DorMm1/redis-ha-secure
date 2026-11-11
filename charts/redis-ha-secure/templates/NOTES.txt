@@ -1,0 +1,21 @@
+{{- $full := include "redis-ha-secure.redisFullname" . -}}
+{{- $sub := index .Values "redis-ha" -}}
+redis-ha-secure {{ .Chart.Version }} (redis-ha {{ (index .Chart.Dependencies 0).Version }}, Redis {{ $sub.image.tag }})
+ACL phase: {{ .Values.acl.phase }}{{ if eq (int .Values.acl.phase) 2 }} (default demoted: {{ .Values.acl.phase2.demoteDefault }}){{ end }}
+Catalog users: {{ len .Values.aclUsers }}
+
+Sentinel-aware clients:
+  master name : {{ include "redis-ha-secure.masterGroupName" . }}
+  sentinels   : {{ range $i := until (int $sub.replicas) }}{{ $full }}-announce-{{ $i }}.{{ $.Release.Namespace }}.svc:{{ $sub.sentinel.port }} {{ end }}
+  credentials : Secret redis-acl-<serviceAccount> in each workload namespace (keys username/password)
+{{- if $sub.haproxy.enabled }}
+  haproxy     : {{ $full }}-haproxy.{{ .Release.Namespace }}.svc:{{ $sub.haproxy.servicePort }}
+{{- end }}
+
+ACL reload Job logs:
+  kubectl -n {{ .Release.Namespace }} logs job/{{ include "redis-ha-secure.fullname" . }}-acl-reload -c acl-reload
+{{- if and .Values.linkerd.enabled (not (or .Values.linkerd.monitoring.serviceAccounts .Values.linkerd.monitoring.networks)) }}
+
+WARNING: linkerd.monitoring has no identities/networks. The exporter (9121) is not
+authorized for any scraper.
+{{- end }}

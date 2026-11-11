@@ -1,0 +1,57 @@
+{{- if .Values.acl.reload.enabled }}
+{{- $full := include "redis-ha-secure.fullname" . }}
+# ---------------------------------------------------------------------------
+# ACL reload. Waits for kubelet to propagate the ACL Secret, then ACL LOAD on
+# every node (no restarts). Manual equivalent: README "Manual ACL reload".
+#
+# Hook placement (ordering matters):
+#   install : post-install. Pods start with the file, and the Job verifies it.
+#   upgrade : PRE-upgrade, right after the build hook and BEFORE any workload changes.
+#             New identities (e.g. haproxy-user when HAProxy is enabled,
+#             migration-user) must be live before `helm --wait` waits for the pods
+#             that authenticate with them (otherwise: deadlock). Runs against the
+#             currently running pods.
+#   rollback: pre-rollback (the build hook re-renders the target revision's ACLs).
+# Argo CD maps pre-* to PreSync and post-install to PostSync.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  # Hook-managed copy of the scripts: at pre-upgrade time the regular
+  # <full>-acl-scripts ConfigMap still holds the PREVIOUS release's scripts.
+  name: {{ $full }}-acl-hook-scripts
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade,pre-rollback
+    helm.sh/hook-weight: "-30"
+    helm.sh/hook-delete-policy: before-hook-creation
+data:
+  acl-lib.sh: |
+    {{- .Files.Get "files/acl-lib.sh" | nindent 4 }}
+  acl-reload.sh: |
+    {{- .Files.Get "files/acl-reload.sh" | nindent 4 }}
+  wait-for-mount.sh: |
+    {{- .Files.Get "files/wait-for-mount.sh" | nindent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $full }}-acl-reload
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+    app.kubernetes.io/component: acl-reload
+  annotations:
+    helm.sh/hook: post-install,pre-upgrade,pre-rollback
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: {{ .Values.acl.reload.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.jobs.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ .Values.jobs.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      {{- include "redis-ha-secure.opsPodMeta" (dict "root" . "component" "acl-reload") | nindent 6 }}
+    spec:
+      {{- include "redis-ha-secure.opsPodSpec" (dict "root" . "mode" "wait" "script" "acl-reload.sh" "scripts" (printf "%s-acl-hook-scripts" $full)) | nindent 6 }}
+{{- end }}

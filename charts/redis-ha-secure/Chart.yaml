@@ -1,0 +1,21 @@
+apiVersion: v2
+name: redis-ha-secure
+description: >-
+  Hardened, GitOps-friendly wrapper around the DandyDeveloper redis-ha chart:
+  Redis 8 + Sentinel (1 master, 2 replicas, 3 sentinels) with a declarative ACL
+  catalog mapped 1:1 to Kubernetes ServiceAccounts, hot ACL reload without pod
+  restarts, Linkerd policies, NetworkPolicy and PrometheusRules.
+type: application
+version: 1.0.0
+appVersion: "8.8.4"
+keywords:
+  - redis
+  - sentinel
+  - acl
+  - linkerd
+dependencies:
+  - name: redis-ha
+    # Pinned. Every key under `redis-ha:` in values.yaml was verified against
+    # https://github.com/DandyDeveloper/charts/blob/master/charts/redis-ha/values.yaml (chart 4.39.0)
+    version: 4.39.0
+    repository: https://dandydeveloper.github.io/charts

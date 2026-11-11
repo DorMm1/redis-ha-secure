@@ -1,0 +1,58 @@
+# =============================================================================
+# EDOT Collector additions for redis-ha-secure (merge into your collector config,
+# e.g. the `cluster` collector of Elastic's opentelemetry-kube-stack Helm values).
+#
+# Run this in ONE collector instance (a Deployment, not the per-node DaemonSet),
+# or every target is scraped once per node.
+# Components used: prometheusreceiver (EDOT "Extended"), plus the elasticsearch/otlp
+# exporter your pipeline already has. Requires get/list/watch on pods in the Redis
+# namespace (the kube-stack collector ClusterRole already grants it).
+# Replace `redis` (namespace) and `redis` (Helm release) below.
+# =============================================================================
+receivers:
+  prometheus/redis-ha:
+    config:
+      scrape_configs:
+        - job_name: redis-ha
+          scrape_interval: 30s
+          scrape_timeout: 10s
+          kubernetes_sd_configs:
+            - role: pod
+              namespaces:
+                names: [redis]
+          relabel_configs:
+            # only pods of this release that opted in (values-edot.yaml)
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+              action: keep
+              regex: "true"
+            - source_labels: [__meta_kubernetes_pod_label_release]
+              action: keep
+              regex: redis
+            - source_labels: [__meta_kubernetes_pod_phase]
+              action: keep
+              regex: Running
+            # scrape <pod-ip>:<prometheus.io/port><prometheus.io/path>
+            - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+              action: replace
+              regex: '([^:]+)(?::\d+)?;(\d+)'
+              replacement: '$$1:$$2'   # `$$` = literal `$` in collector config
+              target_label: __address__
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+              action: replace
+              regex: (.+)
+              target_label: __metrics_path__
+            # labels used by the Kibana rules (docs/monitoring/edot/kibana-alerts.md)
+            - source_labels: [__meta_kubernetes_namespace]
+              target_label: namespace
+            - source_labels: [__meta_kubernetes_pod_name]
+              target_label: pod
+            - source_labels: [__meta_kubernetes_pod_label_app]
+              target_label: app
+
+service:
+  pipelines:
+    metrics/redis-ha:
+      receivers: [prometheus/redis-ha]
+      # reuse your existing processors/exporters, for example:
+      processors: [batch]
+      exporters: [elasticsearch/otel]

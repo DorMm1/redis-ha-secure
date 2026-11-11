@@ -75,8 +75,10 @@ spec:
         {{- end }}
     - to: {{- toYaml .Values.networkPolicy.egress.dns | nindent 8 }}
       ports:
-        - { port: 53, protocol: UDP }
-        - { port: 53, protocol: TCP }
+        {{- range .Values.networkPolicy.egress.dnsPorts }}
+        - { port: {{ . }}, protocol: UDP }
+        - { port: {{ . }}, protocol: TCP }
+        {{- end }}
     {{- if .Values.linkerd.enabled }}
     - to: {{- toYaml .Values.networkPolicy.egress.linkerdControlPlane | nindent 8 }}
       ports:
@@ -156,8 +158,10 @@ spec:
         {{- end }}
     - to: {{- toYaml .Values.networkPolicy.egress.dns | nindent 8 }}
       ports:
-        - { port: 53, protocol: UDP }
-        - { port: 53, protocol: TCP }
+        {{- range .Values.networkPolicy.egress.dnsPorts }}
+        - { port: {{ . }}, protocol: UDP }
+        - { port: {{ . }}, protocol: TCP }
+        {{- end }}
     {{- if .Values.linkerd.enabled }}
     - to: {{- toYaml .Values.networkPolicy.egress.linkerdControlPlane | nindent 8 }}
       ports:

@@ -1,0 +1,56 @@
+# =============================================================================
+# OpenShift overlay (README "OpenShift"). Layer it like the others:
+#   helm upgrade --install redis charts/redis-ha-secure -n redis \
+#     -f values.yaml -f values-phase2.yaml [-f values-haproxy.yaml] -f values-openshift.yaml \
+#     [-f values-edot.yaml]
+#
+# Cluster prerequisites (not managed by this chart):
+#  * Linkerd installed with the CNI plugin (linkerd-cni). OpenShift's SCCs do not grant
+#    the NET_ADMIN/NET_RAW capabilities that the linkerd-init container needs.
+#  * Client workloads (aclUsers) are meshed too, so their ServiceAccounts also need
+#    nonroot-v2: `oc -n <ns> adm policy add-scc-to-user nonroot-v2 -z <sa>`.
+#
+# Security model: meshed pods run under the nonroot-v2 SCC (fixed non-root UIDs; the
+# Linkerd proxy is UID 2102). The chart keeps its fixed UIDs (Redis/Sentinel/exporter
+# 1000, HAProxy 99, Jobs 65532) and binds its own ServiceAccounts to nonroot-v2. All
+# other hardening (runAsNonRoot, readOnlyRootFilesystem, drop ALL, no privilege
+# escalation, seccomp RuntimeDefault) already matches nonroot-v2's requirements.
+# =============================================================================
+openshift:
+  enabled: true
+  scc:
+    bind: true
+    clusterRole: system:openshift:scc:nonroot-v2
+
+global:
+  compatibility:
+    openshift:
+      # The subchart would otherwise strip runAsUser/runAsGroup/fsGroup on OpenShift
+      # ("auto"). Under nonroot-v2 no UID is assigned, so the Redis image (default
+      # user root) would then fail runAsNonRoot. Validated by the chart.
+      adaptSecurityContext: disabled
+
+networkPolicy:
+  egress:
+    # OpenShift DNS (CoreDNS) runs in openshift-dns and listens on 5353 (the Service
+    # maps 53 -> 5353; NetworkPolicy matches the pod port).
+    dns:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: openshift-dns
+        podSelector:
+          matchLabels:
+            dns.operator.openshift.io/daemonset-dns: default
+    dnsPorts: [53, 5353]
+
+# -----------------------------------------------------------------------------
+# Without Linkerd (not the tested path): pods can run under the default restricted-v2
+# SCC with namespace-assigned UIDs instead. Use these overrides instead of the above:
+#   openshift: { enabled: true, scc: { bind: false } }
+#   global: { compatibility: { openshift: { adaptSecurityContext: force } } }
+#   linkerd: { enabled: false }
+#   redis-ha: { redis: { podAnnotations: { linkerd.io/inject: disabled } } }   # and HAProxy, jobs, migration, dr
+#   jobs: { podSecurityContext: { runAsUser: null, runAsGroup: null, fsGroup: null } }
+# The exporter / acl-watch sidecars and the DR restore init containers inherit the
+# pod-level UID, so they need no extra changes.
+# -----------------------------------------------------------------------------

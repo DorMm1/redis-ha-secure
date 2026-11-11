@@ -252,6 +252,9 @@ networkPolicy:
         podSelector:
           matchLabels:
             k8s-app: kube-dns
+    # Ports the DNS pods listen on (NetworkPolicy matches the POD port, not the Service
+    # port). OpenShift DNS pods listen on 5353 (values-openshift.yaml).
+    dnsPorts: [53]
     # Linkerd control plane (identity 8080, destination 8086, policy 8090).
     linkerdControlPlane:
       - namespaceSelector:
@@ -361,6 +364,20 @@ dr:
     backupId: ""
     # Fixed name: the subchart does not template extraInitContainers.
     configMapName: redis-ha-dr-restore
+
+# -----------------------------------------------------------------------------
+# OpenShift (values-openshift.yaml). Linkerd's proxy runs as the fixed UID 2102, which
+# the default restricted-v2 SCC rejects, so meshed pods need nonroot-v2 (any fixed
+# non-root UID, fsGroup allowed). The chart binds ITS OWN ServiceAccounts to that SCC
+# through the SCC's "use" ClusterRole (what `oc adm policy add-scc-to-user` does):
+# redis, HAProxy, ACL build (hook) / reload / drift, migration, DR backup.
+# Client workloads in other namespaces need the same binding for their own SAs.
+# -----------------------------------------------------------------------------
+openshift:
+  enabled: false
+  scc:
+    bind: true
+    clusterRole: system:openshift:scc:nonroot-v2
 
 # -----------------------------------------------------------------------------
 # Linkerd authorization policy
@@ -669,9 +686,9 @@ redis-ha:
       resources:
         requests: { cpu: 20m, memory: 48Mi }
         limits: { cpu: 200m, memory: 48Mi }
+      # UID/GID come from the pod securityContext (redis-ha.securityContext), so a
+      # platform that assigns UIDs (OpenShift restricted-v2) can adapt them in one place.
       securityContext:
-        runAsUser: 1000
-        runAsGroup: 1000
         runAsNonRoot: true
         readOnlyRootFilesystem: true
         allowPrivilegeEscalation: false
@@ -701,9 +718,9 @@ redis-ha:
       resources:
         requests: { cpu: 5m, memory: 8Mi }
         limits: { cpu: 50m, memory: 16Mi }
+      # UID/GID come from the pod securityContext (redis-ha.securityContext), so a
+      # platform that assigns UIDs (OpenShift restricted-v2) can adapt them in one place.
       securityContext:
-        runAsUser: 1000
-        runAsGroup: 1000
         runAsNonRoot: true
         readOnlyRootFilesystem: true
         allowPrivilegeEscalation: false

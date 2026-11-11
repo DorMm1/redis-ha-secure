@@ -1,0 +1,44 @@
+# =============================================================================
+# Elastic EDOT monitoring overlay (README "Monitoring with Elastic EDOT").
+# Replaces the Prometheus Operator objects (PodMonitor / PrometheusRule) with:
+#  * standard prometheus.io/* scrape annotations on the Redis pods (redis_exporter,
+#    :9121, logs in as exporter-user) and the HAProxy pods (:9101). The EDOT
+#    Collector's prometheus receiver discovers them (docs/monitoring/edot/collector.yaml).
+#    The collector needs NO Redis credentials.
+#  * Kibana alerting rules instead of PrometheusRules (docs/monitoring/edot/kibana-alerts.md)
+# Set the collector's namespace / identity below to your EDOT installation.
+# =============================================================================
+monitoring:
+  podMonitor:
+    enabled: false
+  prometheusRule:
+    enabled: false
+
+networkPolicy:
+  monitoring:
+    # Namespace of the EDOT Collector that scrapes (Elastic's kube-stack quickstart
+    # installs it in opentelemetry-operator-system).
+    from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: opentelemetry-operator-system
+
+linkerd:
+  monitoring:
+    # The metrics ports have a Linkerd Server, so the scraper must be authorized:
+    # meshed collector -> its ServiceAccount; unmeshed collector -> its pod CIDR(s).
+    serviceAccounts: []   # - { name: opentelemetry-kube-stack-cluster-stats-collector, namespace: opentelemetry-operator-system }
+    networks: []          # - cidr: 10.128.0.0/14
+
+redis-ha:
+  redis:
+    podAnnotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "9121"
+      prometheus.io/path: /metrics
+  haproxy:
+    # Only rendered in HAProxy mode (values-haproxy.yaml already enables the metrics endpoint).
+    podAnnotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "9101"
+      prometheus.io/path: /metrics

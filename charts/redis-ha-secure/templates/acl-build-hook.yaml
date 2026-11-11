@@ -48,6 +48,25 @@ subjects:
   - kind: ServiceAccount
     name: {{ $sa }}
     namespace: {{ .Release.Namespace }}
+{{- if and .Values.openshift.enabled .Values.openshift.scc.bind }}
+---
+# OpenShift: the (meshed) build Job runs before the release's SCC RoleBinding exists.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $sa }}-scc
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+  annotations: {{- toYaml $hookRbac | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Values.openshift.scc.clusterRole }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- /* One Role per client namespace: only the Secrets of that namespace's catalog users. */}}
 {{- $byNs := dict -}}
 {{- range .Values.aclUsers -}}

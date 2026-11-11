@@ -32,6 +32,8 @@ charts/redis-ha-secure/
   values-phase2.yaml       acl.phase: 2
   values-haproxy.yaml      HAProxy mode (clients connect through HAProxy only)
   values-dr-restore.yaml   DR bootstrap restore overlay (init containers on every Redis pod)
+  values-openshift.yaml    OpenShift overlay (nonroot-v2 SCC binding, fixed UIDs kept, OpenShift DNS)
+  values-edot.yaml         Elastic EDOT monitoring overlay (scrape annotations instead of PodMonitor/PrometheusRule)
   files/                   job scripts (build, reload, drift, lib, wait-for-mount, dr-*)
   templates/
     acl-build-hook.yaml    pre-install/pre-upgrade: RBAC + catalog + ACL build Job
@@ -40,9 +42,14 @@ charts/redis-ha-secure/
     migration.yaml         RedisShake live migration from the old cluster (migration.enabled)
     dr.yaml                DR backup CronJob (dr.backup) + restore ConfigMap (dr.restore)
     acl-drift-cronjob.yaml ACL drift check
-    networkpolicy.yaml     NetworkPolicy
-    linkerd-policy.yaml    Server / MeshTLSAuthentication / AuthorizationPolicy
-    monitoring.yaml        PodMonitor + PrometheusRule
+    network/
+      networkpolicy.yaml   NetworkPolicy
+      linkerd-policy.yaml  Server / MeshTLSAuthentication / AuthorizationPolicy
+    monitoring/
+      prometheus-operator.yaml  PodMonitor + PrometheusRule (monitoring.podMonitor / prometheusRule)
+    openshift/
+      scc-rolebinding.yaml SCC "use" binding for the release's ServiceAccounts (openshift.enabled)
+docs/monitoring/edot/      EDOT Collector receiver config + Kibana alerting rules
 scripts/                   test scripts 01-09, rotate-password.sh, ci/ (kind, docker-desktop, legacy values)
 ```
 
@@ -115,7 +122,7 @@ syntax-checked with `haproxy -c` against the real 3.3.17 binary in test 01):
 - Health checks authenticate as `haproxy-user` (Redis: `+ping +info +role`; Sentinel:
   `+ping +sentinel|get-master-addr-by-name`), never as `default`. The chart only injects `$AUTH`,
   so `haproxy-user` shares the `default-password` *secret* while being a separate least-privilege *identity*.
-  Sentinel checks never send `QUIT` (Redis 8 Sentinel: unknown command ? check never passes).
+  Sentinel checks never send `QUIT` (Redis 8 Sentinel: unknown command, so the check never passes).
 - `init-state down`: no traffic to a server before its first successful check. The built-in config
   briefly routes to replicas when HAProxy starts.
 - `on-marked-down shutdown-sessions`: when the old master is demoted, HAProxy closes its client sessions
@@ -171,7 +178,7 @@ Every container has resource limits, including Sentinel, split-brain-fix, init, 
 acl-watch, HAProxy and the Linkerd proxy (via annotations). `scripts/ci/check-limits.py` enforces this in test 01.
 
 ### Network and mesh
-- **NetworkPolicy** (`templates/networkpolicy.yaml`; the chart's own is disabled). Ingress to
+- **NetworkPolicy** (`templates/network/networkpolicy.yaml`; the chart's own is disabled). Ingress to
   6379/26379 is allowed only from the Redis pods themselves, the release's ops Jobs, the
   namespaces derived from `aclUsers` (plus `networkPolicy.extraClientNamespaces`), and
   monitoring (9121, Linkerd 4191). Port 4143 is also allowed because Linkerd's *opaque transport* sends meshed
@@ -539,6 +546,23 @@ the migration and point the clients at the standby. Limits: asynchronous, one di
 supported by RedisShake 4.7.0 on Redis 8**, and you pay for a second cluster. For most workloads, backups +
 R1 (RTO of minutes) are enough. Add the standby only if the RTO requires it.
 
+### OpenShift (`values-openshift.yaml`)
+Prerequisites: Linkerd with the **CNI plugin** (`linkerd-init` needs NET_ADMIN/NET_RAW, which no default SCC grants),
+and the client workloads' own ServiceAccounts bound to `nonroot-v2` (`oc -n <ns> adm policy add-scc-to-user nonroot-v2 -z <sa>`).
+
+| Topic | Default OpenShift behavior | What the overlay does |
+|---|---|---|
+| SCC | `restricted-v2`: namespace-assigned UIDs only. The Linkerd proxy's fixed UID 2102 is rejected | Binds the release's SAs (Redis, HAProxy, ACL build hook, reload/drift, migration, DR backup) to `nonroot-v2` via its "use" ClusterRole (`openshift.scc.clusterRole`) |
+| UIDs | The subchart strips `runAsUser`/`runAsGroup`/`fsGroup` when it detects OpenShift (`adaptSecurityContext: auto`) | Sets it to `disabled`. `nonroot-v2` assigns no UID, so stripping would make the Redis image (default user root) fail `runAsNonRoot`. The chart refuses the combination |
+| Sidecars / init containers | n/a | Exporter, acl-watch and DR restore containers take the UID from the pod securityContext (one place to adapt) |
+| DNS egress | DNS pods in `openshift-dns` listen on **5353** (the Service maps 53 to 5353) | `networkPolicy.egress.dns` + `dnsPorts: [53, 5353]`. The chart refuses OpenShift without 5353 |
+| Hardening | `nonroot-v2` requires drop ALL, no privilege escalation, seccomp `runtime/default` | Already the chart's defaults. Nothing to relax |
+
+Without Linkerd, pods can run under plain `restricted-v2` with namespace-assigned UIDs. The overlay
+documents those overrides at the bottom (`adaptSecurityContext: force`, Job UIDs `null`); that path is untested.
+Test 01 renders the overlay with `--api-versions security.openshift.io/v1` (so the subchart believes it runs
+on OpenShift) and asserts the UIDs, the SCC bindings, the DNS rule and the negative cases. It has **not** run on a real OpenShift cluster.
+
 ### Pitfalls
 - `subPath` mounts never receive Secret updates, so the chart refuses them.
 - ACL rules are additive. Every generated line starts with `reset`, so `ACL LOAD` gives the exact state.
@@ -571,7 +595,23 @@ R1 (RTO of minutes) are enough. Add the standby only if the RTO requires it.
 ---
 
 ## 4. Monitoring
-redis_exporter runs as an extra container (`exporter-user`), scraped by `PodMonitor`. PrometheusRules:
+redis_exporter runs as an extra container (`exporter-user`). Two ways to collect from it:
+
+- **Prometheus Operator** (default): `PodMonitor` + the `PrometheusRule` below (`templates/monitoring/`).
+- **Elastic EDOT** (`values-edot.yaml`): no Prometheus CRDs. The Redis pods (`:9121`) and HAProxy pods
+  (`:9101`) carry standard `prometheus.io/scrape|port|path` annotations. The EDOT Collector's
+  `prometheusreceiver` discovers them with
+  [docs/monitoring/edot/collector.yaml](docs/monitoring/edot/collector.yaml) (validated with
+  `otelcol-contrib validate`, v0.164.0). The exporter keeps the Redis credentials, so the collector
+  needs none, and ACL-denial metrics stay available (the OTel `redisreceiver` has none).
+  The alerts become Kibana rules: [docs/monitoring/edot/kibana-alerts.md](docs/monitoring/edot/kibana-alerts.md)
+  (same thresholds; ES|QL). There is no kube-state-metrics, so the backup/drift/reload alerts use the jobs' own log
+  lines (`[dr-upload] uploaded`, `[acl-drift] OK:`/`DRIFT:`, `[acl-reload] ERROR`).
+  Set the collector's namespace in `networkPolicy.monitoring.from`, and authorize it in Linkerd
+  (`linkerd.monitoring.serviceAccounts` if meshed, `linkerd.monitoring.networks` CIDRs if not).
+  Run the scrape in one collector Deployment, not the per-node DaemonSet.
+
+PrometheusRules (and their Kibana equivalents):
 
 | Alert | Expression (abridged) |
 |---|---|
@@ -601,7 +641,7 @@ All scripts are bash. On Windows, run them from Git Bash. Secrets are never prin
 
 | Script | What it proves |
 |---|---|
-| `scripts/01-lint-template.sh` | `helm lint --strict` and `helm template` for both phases. Rendered config assertions (aclfile, maxmemory, no subPath, opaque ports, limits and securityContext on every container, rule rendering). Negative tests: wildcard namespace, subPath, rename CONFIG, requests≠limits, opaque ports, unsafe channel, HAProxy default config, quorum, plus the maxmemory table. No cluster needed. |
+| `scripts/01-lint-template.sh` | `helm lint --strict` and `helm template` for both phases. Rendered config assertions (aclfile, maxmemory, no subPath, opaque ports, limits and securityContext on every container, rule rendering). Negative tests: wildcard namespace, subPath, rename CONFIG, requests≠limits, opaque ports, unsafe channel, HAProxy default config, quorum, plus the maxmemory table. DR, OpenShift (simulated OpenShift API, `scripts/ci/check-openshift.py`) and EDOT overlay assertions. No cluster needed. |
 | `scripts/ci/kind-up.sh` | Local cluster: kind (1 control plane + 3 workers, one per zone) with Calico so NetworkPolicy is enforced |
 | `scripts/02-deploy-verify.sh` | Deploy and check: anti-affinity, PDB, `INFO replication`, `SENTINEL MASTER` / `CKQUORUM` on every Sentinel, identical memory config, identical ACLs, revision mounted == loaded, credential Secrets, Sentinel-aware clients from their namespaces, and that a non-catalog namespace is blocked by NetworkPolicy |
 | `scripts/03-acl-dryrun.sh` | Catalog-driven `ACL DRYRUN` on every node: allowed/denied keys (`~`, `%R~`, `%W~`), channels, dangerous/admin commands, scripting, Sentinel discovery vs. admin. Real AUTH of every user on every Redis node and Sentinel |

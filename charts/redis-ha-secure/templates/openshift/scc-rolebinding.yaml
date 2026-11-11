@@ -1,0 +1,27 @@
+{{- if and .Values.openshift.enabled .Values.openshift.scc.bind }}
+{{- $sub := index .Values "redis-ha" -}}
+{{- $sas := list (include "redis-ha-secure.redisServiceAccount" .) -}}
+{{- if $sub.haproxy.enabled }}{{ $sas = append $sas (include "redis-ha-secure.haproxyServiceAccount" .) }}{{ end -}}
+{{- if or .Values.acl.reload.enabled .Values.acl.driftCheck.enabled }}{{ $sas = append $sas (include "redis-ha-secure.opsServiceAccount" .) }}{{ end -}}
+{{- if .Values.migration.enabled }}{{ $sas = append $sas (include "redis-ha-secure.migrationServiceAccount" .) }}{{ end -}}
+{{- if .Values.dr.backup.enabled }}{{ $sas = append $sas (include "redis-ha-secure.drBackupServiceAccount" .) }}{{ end -}}
+# OpenShift: allow this release's runtime ServiceAccounts to use the SCC
+# (openshift.scc.clusterRole, default nonroot-v2). The ACL build hook's SA gets its own
+# hook-scoped binding in acl-build-hook.yaml, because hooks run before this exists.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "redis-ha-secure.fullname" . }}-scc
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "redis-ha-secure.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Values.openshift.scc.clusterRole }}
+subjects:
+  {{- range $sas }}
+  - kind: ServiceAccount
+    name: {{ . }}
+    namespace: {{ $.Release.Namespace }}
+  {{- end }}
+{{- end }}

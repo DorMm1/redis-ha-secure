@@ -181,4 +181,46 @@ if helm template "$RELEASE" "$CHART" -n "$NS" -f "$CHART/values.yaml" -f "$CHART
 else
   bad "helm template with values-dr-restore.yaml: $(cat "$OUT/err")"
 fi
+
+info "template layout (network/, monitoring/, openshift/ subfolders)"
+for t in network/networkpolicy.yaml network/linkerd-policy.yaml monitoring/prometheus-operator.yaml; do
+  check "templates/$t renders" helm template "$RELEASE" "$CHART" -n "$NS" -f "$CHART/values.yaml" -f "$CAT" --show-only "templates/$t"
+done
+
+info "OpenShift (values-openshift.yaml, simulated with --api-versions security.openshift.io/v1)"
+OCP=(-f "$CHART/values-openshift.yaml" --api-versions security.openshift.io/v1)
+neg "OpenShift + Linkerd with the subchart's UID stripping (adaptSecurityContext auto) rejected" "${OCP[@]}" --set global.compatibility.openshift.adaptSecurityContext=auto
+neg "OpenShift without DNS port 5353 rejected" "${OCP[@]}" --set 'networkPolicy.egress.dnsPorts={53}'
+neg "OpenShift + Linkerd without a fixed Job UID rejected" "${OCP[@]}" --set jobs.podSecurityContext.runAsUser=null
+for ph in 1 2; do
+  if helm template "$RELEASE" "$CHART" -n "$NS" -f "$CHART/values.yaml" -f "$CHART/values-phase$ph.yaml" "${HAPF[@]}" -f "$CAT" "${DRF[@]}" \
+    --set dr.backup.enabled=true "${OCP[@]}" >"$OUT/ocp$ph.yaml" 2>"$OUT/err"; then
+    ok "[p$ph] helm template with values-openshift.yaml (HAProxy + DR backup)"
+    if [ -n "$PY" ]; then
+      check "[p$ph] OpenShift: fixed UIDs kept, sidecars inherit the pod UID, SCC bound for every SA (incl. build hook), DNS to openshift-dns:5353" "$PY" "$ROOT/scripts/ci/check-openshift.py" "$OUT/ocp$ph.yaml" "$FULL"
+      check "[p$ph] OpenShift: every container has limits + hardened securityContext" "$PY" "$ROOT/scripts/ci/check-limits.py" "$OUT/ocp$ph.yaml"
+    fi
+  else
+    bad "[p$ph] helm template with values-openshift.yaml: $(cat "$OUT/err")"
+  fi
+done
+if helm template "$RELEASE" "$CHART" -n "$NS" -f "$CHART/values.yaml" -f "$CHART/values-phase2.yaml" -f "$CAT" "${DRF[@]}" \
+  -f "$CHART/values-dr-restore.yaml" --set dr.restore.backupId=20261111T101500Z "${OCP[@]}" >"$OUT/ocpr.yaml" 2>"$OUT/err"; then
+  check "OpenShift + DR restore: restore init containers carry no fixed UID (inherit the pod's)" bash -c "! awk '/name: dr-restore-(fetch|install)\$/,/volumeMounts/' '$OUT/ocpr.yaml' | grep -q runAsUser"
+else
+  bad "helm template OpenShift + restore: $(cat "$OUT/err")"
+fi
+
+info "Elastic EDOT monitoring (values-edot.yaml)"
+if helm template "$RELEASE" "$CHART" -n "$NS" -f "$CHART/values.yaml" -f "$CHART/values-phase2.yaml" "${HAPF[@]}" -f "$CAT" \
+  -f "$CHART/values-edot.yaml" >"$OUT/edot.yaml" 2>"$OUT/err"; then
+  ok "helm template with values-edot.yaml"
+  check "no Prometheus Operator objects (PodMonitor / PrometheusRule)" bash -c "! grep -qE '^kind: (PodMonitor|PrometheusRule)\$' '$OUT/edot.yaml'"
+  check "Redis pods annotated for scraping redis_exporter (:9121)" bash -c "awk '/kind: StatefulSet/,/containers:/' '$OUT/edot.yaml' | grep -q 'prometheus.io/port: \"9121\"'"
+  check "HAProxy pods annotated for scraping (:9101) and the metrics endpoint is on" bash -c "awk '/kind: Deployment/,/containers:/' '$OUT/edot.yaml' | grep -q 'prometheus.io/port: \"9101\"' && grep -q 'use-service prometheus-exporter' '$OUT/edot.yaml'"
+  check "NetworkPolicy admits the EDOT collector namespace on the metrics ports" bash -c "grep -B2 -A12 'opentelemetry-operator-system' '$OUT/edot.yaml' | grep -q 'port: 9121'"
+  [ -n "$PY" ] && check "collector.yaml is valid YAML with the prometheus receiver" "$PY" -c "import yaml,sys; c=yaml.safe_load(open(sys.argv[1])); assert 'prometheus/redis-ha' in c['receivers'] and c['service']['pipelines']['metrics/redis-ha']['receivers']==['prometheus/redis-ha']" "$ROOT/docs/monitoring/edot/collector.yaml"
+else
+  bad "helm template with values-edot.yaml: $(cat "$OUT/err")"
+fi
 summary

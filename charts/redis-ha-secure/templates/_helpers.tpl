@@ -356,6 +356,16 @@ SUBCHART context (.Values = redis-ha values, .Values.global shared).
 {{- end -}}
 {{- if not (has (toString .Values.acl.sentinelClientAccess) (list "auto" "true" "false")) -}}{{- fail "acl.sentinelClientAccess must be auto, true or false" -}}{{- end -}}
 
+{{- /* OpenShift */ -}}
+{{- if .Values.openshift.enabled -}}
+{{- $adapt := toString ((((.Values.global).compatibility).openshift).adaptSecurityContext | default "auto") -}}
+{{- if and .Values.linkerd.enabled (ne $adapt "disabled") -}}{{- fail "openshift + Linkerd: set global.compatibility.openshift.adaptSecurityContext=disabled. Meshed pods run under nonroot-v2 (proxy UID 2102), which assigns no UID: the chart's fixed non-root UIDs must be kept, or images that default to root fail runAsNonRoot" -}}{{- end -}}
+{{- if .Values.linkerd.enabled -}}
+{{- if not $sub.securityContext.runAsUser -}}{{- fail "openshift + Linkerd (nonroot-v2): redis-ha.securityContext.runAsUser must be a fixed non-root UID" -}}{{- end -}}
+{{- if not .Values.jobs.podSecurityContext.runAsUser -}}{{- fail "openshift + Linkerd (nonroot-v2): jobs.podSecurityContext.runAsUser must be a fixed non-root UID" -}}{{- end -}}
+{{- end -}}
+{{- if and .Values.networkPolicy.enabled .Values.networkPolicy.egress.enabled (not (has "5353" (toStrings (.Values.networkPolicy.egress.dnsPorts | default list)))) -}}{{- fail "openshift: OpenShift DNS pods listen on 5353. Add it to networkPolicy.egress.dnsPorts (values-openshift.yaml) or every pod loses DNS" -}}{{- end -}}
+{{- end -}}
 {{- /* Disaster recovery */ -}}
 {{- $dr := .Values.dr -}}
 {{- if or $dr.backup.enabled $dr.restore.enabled -}}

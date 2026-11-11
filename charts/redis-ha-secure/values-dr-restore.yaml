@@ -34,9 +34,7 @@ redis-ha:
       resources:
         requests: { cpu: 100m, memory: 128Mi }
         limits: { cpu: "1", memory: 512Mi }
-      securityContext:
-        runAsUser: 1000
-        runAsGroup: 1000
+      securityContext:   # UID/GID from the pod securityContext
         runAsNonRoot: true
         readOnlyRootFilesystem: true
         allowPrivilegeEscalation: false
@@ -53,9 +51,7 @@ redis-ha:
       resources:
         requests: { cpu: 100m, memory: 64Mi }
         limits: { cpu: "1", memory: 256Mi }
-      securityContext:
-        runAsUser: 1000
-        runAsGroup: 1000
+      securityContext:   # UID/GID from the pod securityContext
         runAsNonRoot: true
         readOnlyRootFilesystem: true
         allowPrivilegeEscalation: false

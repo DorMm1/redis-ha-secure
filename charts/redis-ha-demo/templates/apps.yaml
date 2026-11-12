@@ -1,0 +1,76 @@
+{{- $full := include "demo.redisFullname" . -}}
+{{- $apps := list
+  (dict "name" "orders-api" "creds" true)
+  (dict "name" "report-reader" "creds" true)
+  (dict "name" "intruder" "creds" false) -}}
+{{- range $apps }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .name }}
+  namespace: {{ $.Release.Namespace }}
+  labels: {{- include "demo.labels" $ | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .name }}
+  namespace: {{ $.Release.Namespace }}
+  labels: {{- include "demo.labels" $ | nindent 4 }}
+    app.kubernetes.io/name: {{ .name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: {{ .name }} }
+  template:
+    metadata:
+      labels: {{- include "demo.labels" $ | nindent 8 }}
+        app.kubernetes.io/name: {{ .name }}
+      annotations:
+        checksum/code: {{ printf "%s%s" ($.Files.Get "files/app.py") ($.Files.Get "files/resp.py") | sha256sum | trunc 16 }}
+        {{- toYaml $.Values.demo.podAnnotations | nindent 8 }}
+    spec:
+      serviceAccountName: {{ .name }}
+      automountServiceAccountToken: false
+      securityContext: {{- include "demo.podSecurityContext" $ | nindent 8 }}
+      containers:
+        - name: app
+          image: {{ $.Values.demo.pythonImage }}
+          command: ["python", "/app/app.py"]
+          env:
+            - { name: ROLE, value: {{ .name }} }
+            - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+            - { name: PYTHONUNBUFFERED, value: "1" }
+            - { name: WRITE_INTERVAL, value: {{ $.Values.demo.writeInterval | quote }} }
+            # intruder: no credentials, just the HAProxy address
+            - { name: TARGET, value: "{{ $full }}-haproxy.{{ $.Release.Namespace }}.svc:6379" }
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 10 }
+          resources: {{- toYaml $.Values.demo.resources | nindent 12 }}
+          securityContext: {{- include "demo.containerSecurityContext" $ | nindent 12 }}
+          volumeMounts:
+            - { name: code, mountPath: /app, readOnly: true }
+            {{- if .creds }}
+            - { name: creds, mountPath: /creds, readOnly: true }
+            {{- end }}
+      volumes:
+        - name: code
+          configMap: { name: redis-demo-code }
+        {{- if .creds }}
+        # Written by redis-ha-secure's ACL build Job (username, password, redis-address).
+        - name: creds
+          secret: { secretName: redis-acl-{{ .name }} }
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .name }}
+  namespace: {{ $.Release.Namespace }}
+  labels: {{- include "demo.labels" $ | nindent 4 }}
+spec:
+  selector: { app.kubernetes.io/name: {{ .name }} }
+  ports: [{ name: http, port: 8080, targetPort: http }]
+{{- end }}

@@ -1,0 +1,118 @@
+{{- /*
+In-cluster S3 store standing in for an off-cluster bucket: `rclone serve s3` (:8080) for
+the backup Jobs and the restore init containers, plus a read-only `rclone serve http`
+(:8081) the dashboard uses to list backups. Credentials are generated once and kept
+across upgrades (lookup). Data lives on a PVC that survives Redis disasters.
+*/ -}}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace "redis-demo-store-auth" -}}
+{{- $ak := printf "demo%s" (randAlphaNum 12 | lower) -}}
+{{- $sk := randAlphaNum 40 -}}
+{{- if $existing -}}
+{{- $ak = index $existing.data "access-key" | b64dec -}}
+{{- $sk = index $existing.data "secret-key" | b64dec -}}
+{{- end -}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-demo-store-auth
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "demo.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  access-key: {{ $ak | quote }}
+  secret-key: {{ $sk | quote }}
+  auth: {{ printf "%s,%s" $ak $sk | quote }}
+---
+# rclone remote "s3" for redis-ha-secure's dr.storage (backup Jobs + restore init containers)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ (index .Values "redis-ha-secure").dr.storage.existingSecret }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "demo.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  RCLONE_CONFIG_S3_TYPE: s3
+  RCLONE_CONFIG_S3_PROVIDER: Other
+  RCLONE_CONFIG_S3_ENDPOINT: "http://redis-demo-store.{{ .Release.Namespace }}.svc:8080"
+  RCLONE_CONFIG_S3_ACCESS_KEY_ID: {{ $ak | quote }}
+  RCLONE_CONFIG_S3_SECRET_ACCESS_KEY: {{ $sk | quote }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-demo-store
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "demo.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: {{ .Values.demo.store.size }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-demo-store
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "demo.labels" . | nindent 4 }}
+    app.kubernetes.io/name: redis-demo-store
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: redis-demo-store }
+  template:
+    metadata:
+      labels: {{- include "demo.labels" . | nindent 8 }}
+        app.kubernetes.io/name: redis-demo-store
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {{- include "demo.podSecurityContext" . | nindent 8 }}
+      initContainers:
+        - name: bucket
+          image: {{ .Values.demo.rcloneImage }}
+          command: ["/bin/sh", "-c", "mkdir -p /store/redis-dr"]
+          resources: {{- toYaml .Values.demo.resources | nindent 12 }}
+          securityContext: {{- include "demo.containerSecurityContext" . | nindent 12 }}
+          volumeMounts: [{ name: store, mountPath: /store }]
+      containers:
+        - name: s3
+          image: {{ .Values.demo.rcloneImage }}
+          command: ["/bin/sh", "-c", 'exec rclone serve s3 /store --addr :8080 --auth-key "$AUTH" --vfs-cache-mode writes --cache-dir /cache']
+          env:
+            - { name: HOME, value: /cache }
+            - name: AUTH
+              valueFrom: { secretKeyRef: { name: redis-demo-store-auth, key: auth } }
+          ports: [{ name: s3, containerPort: 8080 }]
+          readinessProbe: { tcpSocket: { port: 8080 }, periodSeconds: 5 }
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits: { cpu: "1", memory: 256Mi }
+          securityContext: {{- include "demo.containerSecurityContext" . | nindent 12 }}
+          volumeMounts: [{ name: store, mountPath: /store }, { name: cache, mountPath: /cache }]
+        - name: browse
+          image: {{ .Values.demo.rcloneImage }}
+          command: ["rclone", "serve", "http", "/store", "--addr", ":8081", "--read-only", "--dir-cache-time", "2s"]
+          env: [{ name: HOME, value: /cache }]
+          ports: [{ name: browse, containerPort: 8081 }]
+          resources: {{- toYaml .Values.demo.resources | nindent 12 }}
+          securityContext: {{- include "demo.containerSecurityContext" . | nindent 12 }}
+          volumeMounts: [{ name: store, mountPath: /store, readOnly: true }, { name: cache, mountPath: /cache }]
+      volumes:
+        - name: store
+          persistentVolumeClaim: { claimName: redis-demo-store }
+        - name: cache
+          emptyDir: { sizeLimit: 1Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-demo-store
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "demo.labels" . | nindent 4 }}
+spec:
+  selector: { app.kubernetes.io/name: redis-demo-store }
+  ports:
+    - { name: s3, port: 8080, targetPort: 8080 }
+    - { name: browse, port: 8081, targetPort: 8081 }

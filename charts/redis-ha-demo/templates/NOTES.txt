@@ -1,0 +1,11 @@
+redis-ha-demo is installed in namespace {{ .Release.Namespace }}.
+
+Dashboard:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/redis-demo-dashboard 8080:8080
+  open http://localhost:8080
+
+Guided tour (from the repository root):
+  demo/run-demo.sh tour
+
+Restore after the "rogue deploy" disaster:
+  demo/run-demo.sh restore            # latest backup, or: restore <backup-id>

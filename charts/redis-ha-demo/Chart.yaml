@@ -1,0 +1,14 @@
+apiVersion: v2
+name: redis-ha-demo
+description: >-
+  Interactive showcase for redis-ha-secure: Redis HA (3 Redis + 3 Sentinels, HAProxy,
+  phase-2 ACLs, Linkerd) with demo workloads (a writer, a least-privilege reader, an
+  intruder), an in-cluster S3 store for off-cluster-style backups, and a web dashboard
+  to trigger failovers, ACL checks, backups and a logical disaster, then restore.
+type: application
+version: 1.0.0
+appVersion: "8.8.4"
+dependencies:
+  - name: redis-ha-secure
+    version: 1.0.0
+    repository: file://../redis-ha-secure

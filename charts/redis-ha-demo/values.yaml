@@ -1,0 +1,125 @@
+# =============================================================================
+# redis-ha-demo. Install (or use demo/run-demo.sh up):
+#   helm dependency build charts/redis-ha-demo
+#   helm upgrade --install demo charts/redis-ha-demo -n redis-demo --create-namespace --wait --timeout 20m
+#   kubectl -n redis-demo port-forward svc/redis-demo-dashboard 8080:8080   -> http://localhost:8080
+#
+# DEMO ONLY: the dashboard holds the acl-admin password and the apps' credentials, and
+# the S3 store runs inside the cluster (in production it lives in another failure domain).
+# Sized for a single-node cluster (Docker Desktop): no hard anti-affinity, small memory.
+# =============================================================================
+demo:
+  # Catalog users are namespaced (system.serviceaccount.<ns>.<sa>), so the demo is
+  # pinned to this namespace (validated).
+  namespace: redis-demo
+  pythonImage: public.ecr.aws/docker/library/python:3.13-alpine
+  rcloneImage: docker.io/rclone/rclone:1.76.0
+  # orders-api write interval (seconds)
+  writeInterval: "0.2"
+  store:
+    size: 2Gi
+  podAnnotations:
+    linkerd.io/inject: enabled
+  resources:
+    requests: { cpu: 20m, memory: 32Mi }
+    limits: { cpu: 500m, memory: 96Mi }
+
+redis-ha-secure:
+  acl:
+    phase: 2
+    phase2:
+      demoteDefault: true
+
+  # Two demo identities. The intruder deliberately has NO entry.
+  aclUsers:
+    - namespace: redis-demo
+      serviceAccount: orders-api
+      redis:
+        - keyPrefix: "orders:"
+          access: [read, write]
+        - channel: "orders.events.*"
+          access: [publish, subscribe]
+    - namespace: redis-demo
+      serviceAccount: report-reader
+      redis:
+        - keyPrefix: "orders:"
+          access: [read]
+        - keyPrefix: "reports:"
+          access: [read, write]
+        - channel: "orders.events.*"
+          access: [subscribe]
+
+  linkerd:
+    enabled: true
+    # dashboard: HAProxy (ACL playground) + direct Redis/Sentinel (status, failover)
+    extraClients:
+      - { name: redis-demo-dashboard, namespace: redis-demo }
+    extraIntraClients:
+      - { name: redis-demo-dashboard, namespace: redis-demo }
+
+  monitoring:
+    podMonitor:
+      enabled: false
+    prometheusRule:
+      enabled: false
+
+  dr:
+    storage:
+      # the demo store (templates/store.yaml) creates bucket redis-dr and this Secret
+      remote: "s3:redis-dr/demo"
+      existingSecret: redis-ha-dr-storage
+      egressPorts: [8080]
+    backup:
+      enabled: true
+      schedule: "*/30 * * * *"
+      retention:
+        days: 7
+        keepLast: 10
+      spoolSizeLimit: 1Gi
+
+  redis-ha:
+    hardAntiAffinity: false
+    topologySpreadConstraints:
+      enabled: false
+    persistentVolume:
+      size: 1Gi
+    redis:
+      resources:
+        requests: { cpu: 100m, memory: 384Mi }
+        limits: { cpu: "1", memory: 384Mi }
+      readinessProbe:
+        initialDelaySeconds: 10
+        periodSeconds: 5
+      livenessProbe:
+        initialDelaySeconds: 10
+      startupProbe:
+        initialDelaySeconds: 5
+        periodSeconds: 5
+        failureThreshold: 30
+    sentinel:
+      readinessProbe:
+        initialDelaySeconds: 5
+        periodSeconds: 5
+        successThreshold: 1
+      config:
+        down-after-milliseconds: 5000
+        failover-timeout: 60000
+        parallel-syncs: 1
+        maxclients: 10000
+    # HAProxy mode (same as values-haproxy.yaml), single-node friendly
+    haproxy:
+      enabled: true
+      replicas: 2
+      hardAntiAffinity: false
+      podDisruptionBudget:
+        maxUnavailable: 1
+      deploymentStrategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxSurge: 1
+          maxUnavailable: 1
+      metrics:
+        enabled: true
+      resources:
+        requests: { cpu: 50m, memory: 64Mi }
+        limits: { cpu: "1", memory: 128Mi }

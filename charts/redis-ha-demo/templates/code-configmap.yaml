@@ -1,0 +1,16 @@
+{{- include "demo.validate" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-demo-code
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "demo.labels" . | nindent 4 }}
+data:
+  resp.py: |
+    {{- .Files.Get "files/resp.py" | nindent 4 }}
+  app.py: |
+    {{- .Files.Get "files/app.py" | nindent 4 }}
+  dashboard.py: |
+    {{- .Files.Get "files/dashboard.py" | nindent 4 }}
+  index.html: |
+    {{- .Files.Get "files/index.html" | nindent 4 }}

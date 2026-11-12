@@ -391,6 +391,9 @@ linkerd:
   policyApiVersion: policy.linkerd.io/v1alpha1
   # Extra identities allowed on 6379/26379 in addition to the aclUsers ServiceAccounts.
   extraClients: []   # - { name: debug-tools, namespace: platform }
+  # Operator tooling that must reach the Redis/Sentinel pods DIRECTLY (6379/26379, like the
+  # ops Jobs), e.g. an admin console. Authorization still comes from Redis ACLs (acl-admin).
+  extraIntraClients: []   # - { name: redis-console, namespace: redis }
   monitoring:
     # Meshed Prometheus ServiceAccounts allowed to scrape 9121.
     serviceAccounts: []   # - { name: prometheus-k8s, namespace: monitoring }

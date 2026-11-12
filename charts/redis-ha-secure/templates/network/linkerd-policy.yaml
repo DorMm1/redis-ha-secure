@@ -62,6 +62,11 @@ spec:
     - kind: ServiceAccount
       name: {{ include "redis-ha-secure.haproxyServiceAccount" . }}
     {{- end }}
+    {{- range .Values.linkerd.extraIntraClients }}
+    - kind: ServiceAccount
+      name: {{ .name }}
+      namespace: {{ .namespace | default $.Release.Namespace }}
+    {{- end }}
 {{- $clients := list -}}
 {{- range .Values.aclUsers -}}{{- $clients = append $clients (dict "name" .serviceAccount "namespace" .namespace) -}}{{- end -}}
 {{- range .Values.linkerd.extraClients -}}{{- $clients = append $clients (dict "name" .name "namespace" .namespace) -}}{{- end -}}

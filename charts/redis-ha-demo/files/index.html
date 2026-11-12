@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>redis-ha-secure demo</title>
+<style>
+  :root { --bg:#0f1420; --card:#171e2e; --line:#26304a; --fg:#e6ebf5; --mute:#8b96ad; --ok:#33c481; --bad:#ff5d6c; --warn:#ffb648; --acc:#5b9dff; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:16px 24px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--mute); }
+  main { padding:16px 24px; display:grid; gap:16px; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  section h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--mute); margin:0 0 10px; }
+  .wide { grid-column: 1 / -1; }
+  .nodes { display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; }
+  .node { border:1px solid var(--line); border-radius:8px; padding:10px; }
+  .node.master { border-color: var(--acc); box-shadow: 0 0 0 1px var(--acc) inset; }
+  .node.down { border-color: var(--bad); opacity:.75; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; font-weight:600; }
+  .b-master { background:var(--acc); color:#fff; } .b-replica { background:#2c3756; } .b-down { background:var(--bad); color:#fff; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .warn { color:var(--warn); } .mute { color:var(--mute); }
+  .kv { display:grid; grid-template-columns: 120px 1fr; gap:2px 8px; margin-top:6px; }
+  .kv div:nth-child(odd) { color:var(--mute); }
+  .big { font-size:26px; font-weight:700; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  button { background:#24304d; color:var(--fg); border:1px solid var(--line); border-radius:7px; padding:8px 12px; cursor:pointer; font-weight:600; }
+  button:hover { border-color: var(--acc); }
+  button.danger { background:#4a1d26; border-color:#7a2a37; }
+  button.chip { padding:4px 8px; font-weight:500; font-size:12px; }
+  select, input { background:#0c111b; color:var(--fg); border:1px solid var(--line); border-radius:7px; padding:8px; font:13px ui-monospace, Consolas, monospace; }
+  input { flex:1; min-width:260px; }
+  pre { background:#0c111b; border:1px solid var(--line); border-radius:7px; padding:10px; margin:8px 0 0; white-space:pre-wrap; word-break:break-all; font:12.5px ui-monospace, Consolas, monospace; max-height:220px; overflow:auto; }
+  table { width:100%; border-collapse:collapse; } td, th { text-align:left; padding:4px 6px; border-bottom:1px solid var(--line); font-size:13px; }
+  .scenes ol { margin:0; padding-left:18px; } .scenes li { margin:3px 0; }
+  .log { max-height:260px; overflow:auto; font:12.5px ui-monospace, Consolas, monospace; }
+  .log div { padding:2px 0; border-bottom:1px dashed var(--line); }
+  .tag { display:inline-block; width:72px; color:var(--mute); }
+  code { background:#0c111b; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>redis-ha-secure &mdash; live demo</h1>
+  <span class="sub">3 Redis + 3 Sentinels &middot; HAProxy &middot; ACL users = ServiceAccounts &middot; Linkerd mTLS &middot; off-cluster backups</span>
+  <span id="health" class="badge"></span>
+</header>
+<main>
+  <section class="wide">
+    <h2>Topology (read directly from every node as acl-admin)</h2>
+    <div class="nodes" id="nodes"></div>
+    <div class="row" style="margin-top:10px">
+      <span id="sentinel"></span><span id="acl"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>orders-api &mdash; writer (through HAProxy)</h2>
+    <div class="row"><div><div class="big" id="w-ok">0</div><div class="mute">orders written</div></div>
+      <div><div class="big" id="w-err">0</div><div class="mute">errors</div></div>
+      <div><div class="big" id="w-last">-</div><div class="mute">last order id</div></div></div>
+    <div class="kv" id="w-kv"></div>
+  </section>
+
+  <section>
+    <h2>report-reader &amp; intruder</h2>
+    <div class="kv" id="r-kv"></div>
+    <div class="kv" id="i-kv" style="margin-top:12px"></div>
+  </section>
+
+  <section>
+    <h2>Actions</h2>
+    <div class="row">
+      <button onclick="act('/api/failover')">Sentinel failover</button>
+      <button onclick="act('/api/kill-master')">Kill master pod</button>
+      <button onclick="act('/api/backup')">Backup now</button>
+      <button class="danger" onclick="if(confirm('Delete every orders:* key as orders-api? (logical disaster)')) act('/api/rogue-delete')">Disaster: rogue deploy deletes all orders</button>
+    </div>
+    <pre id="act-out">Pick an action. Watch the topology and the writer react.</pre>
+  </section>
+
+  <section>
+    <h2>ACL playground (through HAProxy)</h2>
+    <div class="row">
+      <select id="who">
+        <option value="orders-api">orders-api (rw orders:*)</option>
+        <option value="report-reader">report-reader (r orders:*, w reports:*)</option>
+        <option value="default">default (phase 2: probe-only)</option>
+        <option value="wrong-password">orders-api with a wrong password</option>
+        <option value="anonymous">anonymous (no AUTH)</option>
+      </select>
+      <input id="cmd" value="GET orders:seq" onkeydown="if(event.key==='Enter') tryAcl()">
+      <button onclick="tryAcl()">Run</button>
+    </div>
+    <div class="row" style="margin-top:8px" id="presets"></div>
+    <pre id="acl-out">Run a command as one of the identities.</pre>
+  </section>
+
+  <section>
+    <h2>Off-cluster backups</h2>
+    <div id="backups"></div>
+    <div id="jobs" style="margin-top:8px"></div>
+    <pre id="restore-hint" class="mute"></pre>
+  </section>
+
+  <section class="scenes">
+    <h2>Scenes (or run demo/run-demo.sh)</h2>
+    <ol>
+      <li><b>Least privilege:</b> playground: <code>SET orders:x 1</code> as report-reader, <code>FLUSHALL</code> as orders-api, anything as <code>default</code>. The intruder panel shows Linkerd refusing an unknown identity.</li>
+      <li><b>Failover:</b> press <i>Sentinel failover</i> or <i>Kill master pod</i>. A new master within seconds, the writer keeps going (short outage), ACLs identical on every node.</li>
+      <li><b>Backup:</b> <i>Backup now</i>. A replica is snapshotted, verified and uploaded.</li>
+      <li><b>Disaster:</b> <i>rogue deploy</i>. All orders vanish on <u>every</u> node: HA replicates mistakes.</li>
+      <li><b>Restore:</b> run the command shown under Backups. The cluster is rebuilt from the backup, back to that point in time.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Event log</h2>
+    <div class="log" id="log"></div>
+  </section>
+</main>
+<script>
+const presets = {
+  "orders-api": ["GET orders:seq", "HGETALL orders:1", "XLEN orders:stream", "SET reports:x 1", "FLUSHALL", "KEYS *", "CONFIG GET maxmemory", "ACL WHOAMI"],
+  "report-reader": ["GET orders:seq", "SET orders:x 1", "SET reports:x 1", "DEL orders:1", "EVAL \"return 1\" 0", "PUBLISH orders.events.created x"],
+  "default": ["PING", "GET orders:seq", "INFO server", "ACL WHOAMI"],
+  "wrong-password": ["PING"], "anonymous": ["PING", "GET orders:seq"] };
+const $ = id => document.getElementById(id);
+const ago = t => t ? Math.max(0, Math.round(Date.now()/1000 - t)) + "s ago" : "-";
+const esc = s => String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+function renderPresets() {
+  $("presets").innerHTML = presets[$("who").value].map(c => `<button class="chip" onclick="$('cmd').value=this.textContent;tryAcl()">${esc(c)}</button>`).join("");
+}
+$("who").onchange = renderPresets; renderPresets();
+async function post(path, body) {
+  const r = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})});
+  return r.json();
+}
+async function act(path) {
+  $("act-out").textContent = "...";
+  const r = await post(path);
+  $("act-out").innerHTML = `<span class="${r.ok ? "ok" : "bad"}">${esc(r.reply)}</span>`;
+}
+async function tryAcl() {
+  $("acl-out").textContent = "...";
+  const r = await post("/api/acl", {identity: $("who").value, command: $("cmd").value});
+  const reply = typeof r.reply === "object" ? JSON.stringify(r.reply, null, 1) : r.reply;
+  $("acl-out").innerHTML = `<span class="${r.ok ? "ok" : "bad"}">${esc(reply)}</span>`;
+}
+function kv(pairs) { return pairs.map(([k, v]) => `<div>${k}</div><div>${v}</div>`).join(""); }
+async function refresh() {
+  let s;
+  try { s = await (await fetch("/api/state")).json(); } catch (e) { $("health").className = "badge b-down"; $("health").textContent = "dashboard unreachable"; return; }
+  const healthy = s.masters.length === 1 && s.sentinel_agree && s.acl_identical && s.nodes.every(n => n.up);
+  $("health").className = "badge " + (healthy ? "b-master" : "b-down");
+  $("health").textContent = healthy ? "healthy" : "degraded";
+  $("nodes").innerHTML = s.nodes.map(n => {
+    if (!n.up) return `<div class="node down"><b>${esc(n.name)}</b> <span class="badge b-down">DOWN</span><div class="mute">${esc(n.error || "")}</div></div>`;
+    const m = n.role === "master";
+    return `<div class="node ${m ? "master" : ""}"><b>${esc(n.name)}</b> <span class="badge ${m ? "b-master" : "b-replica"}">${m ? "MASTER" : "replica"}</span>
+      <div class="kv">${kv([["keys (db0)", n.keys], ["repl offset", n.offset],
+        [m ? "replicas" : "master link", m ? n.replicas : `<span class="${n.link === "up" ? "ok" : "bad"}">${esc(n.link)}</span>`],
+        ["ACL users", n.acl_users], ["ACL digest", `<code>${esc(n.acl_digest)}</code>`],
+        ["sentinel says", esc((n.sentinel_master || n.sentinel_error || "-"))]])}</div></div>`;
+  }).join("");
+  $("sentinel").innerHTML = s.sentinel_agree ? `<span class="ok">&#10003; all Sentinels agree on the master (${esc(s.sentinel_master)})</span>` : `<span class="bad">&#10007; Sentinels disagree / unreachable</span>`;
+  $("acl").innerHTML = s.acl_identical ? `<span class="ok">&#10003; ACLs identical on every node</span>` : `<span class="warn">ACLs differ / node down</span>`;
+  const w = s.apps["orders-api"] || {}, r = s.apps["report-reader"] || {}, i = s.apps["intruder"] || {};
+  $("w-ok").textContent = w.ok ?? "-"; $("w-err").textContent = w.errors ?? "-"; $("w-last").textContent = (w.extra || {}).last_order_id ?? "-";
+  const outages = (w.outages || []).slice(-3).map(o => `${o.seconds}s`).join(", ") || "none";
+  $("w-kv").innerHTML = kv([["last write", ago(w.last_ok)], ["last error", `<span class="${w.last_error && Date.now()/1000 - w.last_error_at < 10 ? "bad" : "mute"}">${esc(w.last_error || "-")}</span>`],
+    ["recent outages", outages], ["identity", `ServiceAccount orders-api &rarr; ACL user system.serviceaccount.${esc(s.namespace)}.orders-api`]]);
+  const re = r.extra || {};
+  $("r-kv").innerHTML = kv([["reader sees", `orders:seq = <b>${esc(re.orders_seq ?? "-")}</b>, stream = ${esc(re.stream_len ?? "-")}`],
+    ["tamper attempt", `<span class="ok">${esc(re.tamper || "-")}</span>`], ["denied so far", r.denied ?? "-"]]);
+  const la = (i.extra || {}).last_attempt || {};
+  $("i-kv").innerHTML = kv([["intruder", `<span class="${(la.verdict || "").includes("blocked") ? "ok" : "bad"}">${esc(la.verdict || "-")}</span>`],
+    ["detail", `<span class="mute">${esc(la.result || i.unreachable || "-")}</span>`], ["attempts blocked", i.denied ?? "-"]]);
+  const b = s.backups || {};
+  $("backups").innerHTML = (b.items || []).length ? `<table><tr><th>backup id</th><th>keys</th><th>from</th></tr>` + b.items.map(x =>
+    `<tr><td><code>${esc(x.id)}</code> ${x.id === b.latest ? '<span class="badge b-master">LATEST</span>' : ""}</td><td>${esc(x.keys || "")}</td><td>${esc(x.source || "")} (${esc(x.role || "")})</td></tr>`).join("") + `</table>`
+    : `<span class="mute">${esc(b.error || "no backups yet - press Backup now")}</span>`;
+  $("jobs").innerHTML = (s.jobs || []).map(j => `<div>${esc(j.name)}: <span class="${j.state === "succeeded" ? "ok" : j.state === "failed" ? "bad" : "warn"}">${esc(j.state || j.error)}</span></div>`).join("");
+  $("restore-hint").textContent = b.latest ? `Restore (from the repo root):\n  demo/run-demo.sh restore ${b.latest}` : "";
+  $("log").innerHTML = (s.events || []).map(e => `<div><span class="tag">${esc(e.kind)}</span>${new Date(e.at*1000).toLocaleTimeString()} &nbsp;${esc(e.msg)}</div>`).join("");
+}
+refresh(); setInterval(refresh, 2000);
+</script>
+</body>
+</html>

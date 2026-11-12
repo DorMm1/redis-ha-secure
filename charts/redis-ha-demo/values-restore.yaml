@@ -1,0 +1,49 @@
+# Restore overlay for the demo = charts/redis-ha-secure/values-dr-restore.yaml nested
+# under the dependency key. Used by `demo/run-demo.sh restore <backup-id>`:
+#   helm upgrade demo charts/redis-ha-demo -n redis-demo -f charts/redis-ha-demo/values-restore.yaml \
+#     --set redis-ha-secure.dr.restore.backupId=<id>
+redis-ha-secure:
+  dr:
+    restore:
+      enabled: true
+      backupId: ""
+  redis-ha:
+    redis:
+      podAnnotations:
+        config.linkerd.io/proxy-enable-native-sidecar: "true"
+    extraInitContainers:
+      - name: dr-restore-fetch
+        image: docker.io/rclone/rclone:1.76.0
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c", "$(DR_RESTORE_FETCH_SH)"]
+        envFrom:
+          - configMapRef: { name: redis-ha-dr-restore }
+          - secretRef: { name: redis-ha-dr-storage }
+        resources:
+          requests: { cpu: 100m, memory: 128Mi }
+          limits: { cpu: "1", memory: 512Mi }
+        securityContext:
+          runAsNonRoot: true
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities: { drop: [ALL] }
+          seccompProfile: { type: RuntimeDefault }
+        volumeMounts:
+          - { name: data, mountPath: /data }
+      - name: dr-restore-install
+        image: public.ecr.aws/docker/library/redis:8.8.4-alpine
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c", "$(DR_RESTORE_INSTALL_SH)"]
+        envFrom:
+          - configMapRef: { name: redis-ha-dr-restore }
+        resources:
+          requests: { cpu: 100m, memory: 64Mi }
+          limits: { cpu: "1", memory: 256Mi }
+        securityContext:
+          runAsNonRoot: true
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities: { drop: [ALL] }
+          seccompProfile: { type: RuntimeDefault }
+        volumeMounts:
+          - { name: data, mountPath: /data }

@@ -1,0 +1,3 @@
+# not part of the package
+*.md
+.git/

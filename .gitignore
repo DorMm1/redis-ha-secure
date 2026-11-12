@@ -6,3 +6,7 @@
 # local test output
 *.log
 *.tmp
+# built by 'helm dependency build charts/redis-ha-demo'
+charts/redis-ha-demo/charts/
+charts/redis-ha-demo/Chart.lock
+

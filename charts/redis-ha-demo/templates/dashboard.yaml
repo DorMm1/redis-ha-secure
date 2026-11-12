@@ -1,0 +1,125 @@
+{{- $full := include "demo.redisFullname" . -}}
+{{- $sec := index .Values "redis-ha-secure" -}}
+{{- $sub := index $sec "redis-ha" -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: redis-demo-dashboard
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "demo.labels" . | nindent 4 }}
+---
+# Exactly what the dashboard's buttons need: delete a Redis pod (chaos), start a Job
+# from the backup CronJob, list backup Jobs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: redis-demo-dashboard
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "demo.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    resourceNames:
+      {{- range $i := until (int ($sub.replicas | default 3)) }}
+      - {{ $full }}-server-{{ $i }}
+      {{- end }}
+    verbs: ["get", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    resourceNames: ["{{ $full }}-dr-backup"]
+    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "list", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: redis-demo-dashboard
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "demo.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: redis-demo-dashboard
+subjects:
+  - kind: ServiceAccount
+    name: redis-demo-dashboard
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-demo-dashboard
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "demo.labels" . | nindent 4 }}
+    app.kubernetes.io/name: redis-demo-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: redis-demo-dashboard }
+  template:
+    metadata:
+      labels: {{- include "demo.labels" . | nindent 8 }}
+        app.kubernetes.io/name: redis-demo-dashboard
+        # allowed by redis-ha-secure's NetworkPolicy like the release's own ops Jobs
+        redis-ha-secure/redis-client: "true"
+      annotations:
+        checksum/code: {{ printf "%s%s%s" (.Files.Get "files/dashboard.py") (.Files.Get "files/index.html") (.Files.Get "files/resp.py") | sha256sum | trunc 16 }}
+        {{- toYaml .Values.demo.podAnnotations | nindent 8 }}
+    spec:
+      serviceAccountName: redis-demo-dashboard
+      automountServiceAccountToken: true
+      securityContext: {{- include "demo.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: dashboard
+          image: {{ .Values.demo.pythonImage }}
+          command: ["python", "/app/dashboard.py"]
+          env:
+            - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+            - { name: PYTHONUNBUFFERED, value: "1" }
+            - { name: NAMESPACE, value: {{ .Release.Namespace | quote }} }
+            - { name: FULLNAME, value: {{ $full | quote }} }
+            - { name: REPLICAS, value: {{ $sub.replicas | default 3 | toString | quote }} }
+            - { name: MASTER_GROUP, value: "mymaster" }
+            - { name: HAPROXY, value: "{{ $full }}-haproxy.{{ .Release.Namespace }}.svc:6379" }
+            - { name: STORE_HTTP, value: "http://redis-demo-store.{{ .Release.Namespace }}.svc:8081" }
+            # dr.storage.remote "s3:<bucket>/<path>" -> "<bucket>/<path>" on the browse endpoint
+            - { name: DR_PREFIX, value: {{ regexReplaceAll "^[^:]*:" $sec.dr.storage.remote "" | quote }} }
+            - { name: BACKUP_CRONJOB, value: "{{ $full }}-dr-backup" }
+            - name: APPS
+              value: {{ dict "orders-api" (printf "http://orders-api.%s.svc:8080/stats" .Release.Namespace) "report-reader" (printf "http://report-reader.%s.svc:8080/stats" .Release.Namespace) "intruder" (printf "http://intruder.%s.svc:8080/stats" .Release.Namespace) | toJson | quote }}
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 10 }
+          resources:
+            requests: { cpu: 50m, memory: 48Mi }
+            limits: { cpu: "1", memory: 128Mi }
+          securityContext: {{- include "demo.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - { name: code, mountPath: /app, readOnly: true }
+            - { name: infra, mountPath: /infra, readOnly: true }
+            - { name: orders-api, mountPath: /creds/orders-api, readOnly: true }
+            - { name: report-reader, mountPath: /creds/report-reader, readOnly: true }
+      volumes:
+        - name: code
+          configMap: { name: redis-demo-code }
+        - name: infra
+          secret:
+            secretName: {{ $sec.infraCredentials.secretName | default "redis-ha-infra-credentials" }}
+            items:
+              - { key: acl-admin-password, path: acl-admin-password }
+              - { key: default-password, path: default-password }
+        - name: orders-api
+          secret: { secretName: redis-acl-orders-api }
+        - name: report-reader
+          secret: { secretName: redis-acl-report-reader }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-demo-dashboard
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "demo.labels" . | nindent 4 }}
+spec:
+  selector: { app.kubernetes.io/name: redis-demo-dashboard }
+  ports: [{ name: http, port: 8080, targetPort: http }]

@@ -223,4 +223,21 @@ if helm template "$RELEASE" "$CHART" -n "$NS" -f "$CHART/values.yaml" -f "$CHART
 else
   bad "helm template with values-edot.yaml: $(cat "$OUT/err")"
 fi
+
+info "demo chart (charts/redis-ha-demo, umbrella over redis-ha-secure)"
+DEMO=$ROOT/charts/redis-ha-demo
+if helm dependency build "$DEMO" >/dev/null 2>"$OUT/err"; then
+  check "helm lint demo chart" helm lint "$DEMO" -n redis-demo
+  if helm template demo "$DEMO" -n redis-demo >"$OUT/demo.yaml" 2>"$OUT/err"; then
+    ok "helm template demo chart"
+    [ -n "$PY" ] && check "demo: every container has limits + hardened securityContext" "$PY" "$ROOT/scripts/ci/check-limits.py" "$OUT/demo.yaml"
+    check "demo: dashboard is an intra identity (direct Redis/Sentinel) and a HAProxy client; the intruder is neither" bash -c "awk '/name: demo-redis-ha-intra\$/,/^---/' '$OUT/demo.yaml' | grep -q 'name: redis-demo-dashboard' && awk '/name: demo-redis-ha-clients\$/,/^---/' '$OUT/demo.yaml' | grep -q 'name: redis-demo-dashboard' && ! grep -A40 'kind: MeshTLSAuthentication' '$OUT/demo.yaml' | grep -q 'name: intruder'"
+    check "demo: restore overlay renders" helm template demo "$DEMO" -n redis-demo -f "$DEMO/values-restore.yaml" --set redis-ha-secure.dr.restore.backupId=20261111T101500Z
+    check "demo: wrong namespace rejected" bash -c "! helm template demo '$DEMO' -n default >/dev/null 2>&1"
+  else
+    bad "helm template demo chart: $(cat "$OUT/err")"
+  fi
+else
+  bad "helm dependency build demo chart: $(cat "$OUT/err")"
+fi
 summary

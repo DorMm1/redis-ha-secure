@@ -20,6 +20,9 @@ What this chart adds on top of the upstream chart:
 - **Disaster recovery.** Hourly, verified, off-cluster RDB backups taken from a replica, and a
   GitOps bootstrap restore that rebuilds an empty cluster from a pinned backup id.
 
+**Try it:** [demo/README.md](demo/README.md) deploys a live showcase (writer, least-privilege reader, intruder,
+dashboard) and walks through ACLs, failover under load, backup, a logical disaster, and restore: `demo/run-demo.sh up`, then `demo/run-demo.sh tour`.
+
 The chart does not fork upstream. Everything goes through upstream's own values and extension points:
 `redis.customConfig`, `sentinel.customConfig`, `extraVolumes`, `redis.extraVolumeMounts`,
 `sentinel.extraVolumeMounts`, `extraContainers`, and `haproxy.customConfig`.
@@ -50,6 +53,8 @@ charts/redis-ha-secure/
     openshift/
       scc-rolebinding.yaml SCC "use" binding for the release's ServiceAccounts (openshift.enabled)
 docs/monitoring/edot/      EDOT Collector receiver config + Kibana alerting rules
+charts/redis-ha-demo/      interactive demo (umbrella chart: redis-ha-secure + demo apps + S3 store + dashboard)
+demo/                      run-demo.sh (up / tour / restore / down) and the demo guide
 scripts/                   test scripts 01-09, rotate-password.sh, ci/ (kind, docker-desktop, legacy values)
 ```
 
@@ -711,6 +716,10 @@ HAProxy mode, run via `scripts/run-all.sh`):** 02 phase 1 38/38, 03 phase 1 203/
   snapshot refused.
 - Found and fixed by these runs: the pre-upgrade reload hook waited forever when the StatefulSet was
   scaled to 0 (now: preflight, then exit), verified live in both directions.
+
+**Demo (docker-desktop, `AUTO=1 demo/run-demo.sh tour`):** 25/25. ACL matrix for 5 identities, intruder blocked
+by Linkerd, Sentinel failover under load (~8.6 s writer outage), backup from a replica, rogue-deploy disaster
+replicated to every node, in-place restore (all PVCs deleted) back to the backup's point in time, overlay removal.
 
 **Not validated on a live cluster** (rendered and asserted only):
 - Prometheus Operator: the `PodMonitor` / `PrometheusRule` objects (metric names were checked against the redis_exporter v1.97.0 source).
